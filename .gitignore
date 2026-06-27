@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 密钥
+*.pem
+
+# 模型
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# 数据
+datasets/
+outputs/
+results_*/
+processData/getmask/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
