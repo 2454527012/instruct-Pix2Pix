@@ -585,36 +585,21 @@ def main():
             ema_unet.to(accelerator.device)
             del load_model
 
-        from safetensors.torch import load_file
-
         for i in range(len(models)):
             model = models.pop()
 
-            unet_dir = os.path.join(input_dir, "unet")
+            # 不要手动找 input_dir/unet
+            # 因为 checkpoint-20000 是 accelerate state 格式：
+            # checkpoint-20000/model.safetensors
+            # checkpoint-20000/optimizer.bin
+            # checkpoint-20000/scheduler.bin
+            #
+            # 真正的 model.safetensors 会由 accelerator.load_state()
+            # 在 hook 执行后自动加载。
 
-            safetensor_path = os.path.join(
-                unet_dir,
-                "diffusion_pytorch_model.safetensors",
-            )
-
-            bin_path = os.path.join(
-                unet_dir,
-                "diffusion_pytorch_model.bin",
-            )
-
-            if os.path.exists(safetensor_path):
-                state_dict = load_file(safetensor_path)
-            elif os.path.exists(bin_path):
-                state_dict = torch.load(bin_path, map_location="cpu")
-            else:
-                raise FileNotFoundError(
-                    f"Cannot find UNet weights in {unet_dir}"
-                )
-
-            model.register_to_config(in_channels=14)
-            model.load_state_dict(state_dict, strict=True)
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
+            model.register_to_config(in_channels=18)
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -784,9 +769,16 @@ def main():
         processed_edits = []
         processed_square_originals = []
         processed_centers = []
-
+ 
         for edit_path, box_path, mask_path in zip(edits, box_urls, masks):
-            orig = fill_box_with_mean_color(box_path, edit_path).convert("RGB")
+            large_region_size = random.randint(768, 1280)
+            orig, inpaint_mask = fill_box_with_mean_color(
+                box_path,
+                edit_path,
+                large_region_prob=0.7,
+                large_region_size=large_region_size,
+            )
+            orig=orig.convert("RGB")
             edit = Image.open(edit_path).convert("RGB")
             mask = Image.open(mask_path).convert("RGB")
 

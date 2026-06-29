@@ -25,7 +25,7 @@ original_images_dir = "/root/autodl-tmp/instruct/instruct-pix2pix/datasets/UAVPD
 xml_dir = "/root/autodl-tmp/instruct/instruct-pix2pix/datasets/UAVPDD/Annotations"
 mask_dir = "/root/autodl-tmp/instruct/instruct-pix2pix/datasets/UAVPDD/masks"
 
-output_dir = "/root/autodl-tmp/instruct/instruct-pix2pix/results_20000_3.0_2.0_50_18"
+output_dir = "/root/autodl-tmp/instruct/instruct-pix2pix/results_20000_3.0_2.0_50_18_inpaint"
 
 val_txt_path = "/root/autodl-tmp/instruct/instruct-pix2pix/datasets/UAVPDD/ImageSets/Main/val.txt"
 
@@ -163,23 +163,30 @@ for idx, image_name in enumerate(val_names, start=1):
         print(f"[{idx}/{total}] Mask not found: {image_name}")
         continue
 
-    output_file = Path(output_dir) / f"{image_name}"
+    output_prefix = Path(output_dir) / image_name
 
-    if output_file.exists():
+    output_generate = Path(f"{output_prefix}_generate.png")
+    output_original = Path(f"{output_prefix}_original.png")
+    output_input = Path(f"{output_prefix}_input.png")
+    output_mask = Path(f"{output_prefix}_mask.png")
+
+    # 只要生成图已经存在，就跳过
+    if output_generate.exists():
         skipped += 1
-        print(f"[{idx}/{total}] Skip existing: {image_name}")
+        print(f"[{idx}/{total}] Skip existing: {output_generate.name}")
         continue
+
 
     try:
         print(f"[{idx}/{total}] Processing: {image_file.name}")
 
         original_image = PIL.Image.open(image_file).convert("RGB")
 
-        input_image = fill_box_with_mean_color(
+        input_image, inpaint_mask = fill_box_with_mean_color(
             str(xml_file),
             str(image_file),
-        ).convert("RGB")
-
+        )
+        input_image=input_image.convert("RGB")
         mask_image = PIL.Image.open(mask_file).convert("RGB")
 
         if original_image.size != input_image.size:
@@ -202,6 +209,7 @@ for idx, image_name in enumerate(val_names, start=1):
                 prompt=prompt,
                 image=input_image,
                 mask=mask_image,
+                inpaint_mask=inpaint_mask,
                 crop_size=512,
                 crop_overlap=128,
                 guidance_scale=3.0,
@@ -212,9 +220,10 @@ for idx, image_name in enumerate(val_names, start=1):
                 return_dict=True,
             ).images[0]
 
-        result.save(f'{output_file}_generate.png')
-        input_image.save(f'{output_file}_input.png')
-        mask_image.save(f'{output_file}_mask.png')
+        original_image.save(output_original)
+        result.save(output_generate)
+        input_image.save(output_input)
+        mask_image.save(output_mask)
         success += 1
         print(f"[{idx}/{total}] Saved: {output_file}")
 
