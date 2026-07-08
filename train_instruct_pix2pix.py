@@ -422,9 +422,15 @@ def parse_args():
     return args
 
 
-def convert_to_np(image, resolution):
-    image = image.convert("RGB").resize((resolution, resolution))
-    return np.array(image).transpose(2, 0, 1)
+def convert_to_np(image):
+    arr = np.array(image)
+
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    else:
+        arr = arr.transpose(2, 0, 1)
+
+    return arr
 
 
 def download_image(url):
@@ -740,25 +746,99 @@ def main():
     import random
     from PIL import Image
 
-    # 辅助函数：解析 XML，返回所有 box 的列表，每个 box 为 (xmin, ymin, xmax, ymax)
     def parse_boxes_from_xml(xml_path):
         try:
             tree = ET.parse(xml_path)
             root = tree.getroot()
+
             boxes = []
-            for obj in root.findall('object'):
-                bndbox = obj.find('bndbox')
-                xmin = int(bndbox.find('xmin').text)
-                ymin = int(bndbox.find('ymin').text)
-                xmax = int(bndbox.find('xmax').text)
-                ymax = int(bndbox.find('ymax').text)
+            for obj in root.findall("object"):
+                bndbox = obj.find("bndbox")
+                if bndbox is None:
+                    continue
+
+                xmin = int(float(bndbox.find("xmin").text))
+                ymin = int(float(bndbox.find("ymin").text))
+                xmax = int(float(bndbox.find("xmax").text))
+                ymax = int(float(bndbox.find("ymax").text))
+
                 boxes.append((xmin, ymin, xmax, ymax))
+
             return boxes
+
         except Exception as e:
-            # 如果 XML 解析失败，返回空列表（等同于无 box 引导）
             print(f"Warning: failed to parse {xml_path}: {e}")
             return []
-        
+
+    def choose_relative_center_from_xml(
+        xml_path,
+        image_w,
+        image_h,
+        box_near_prob=0.8,
+        max_retry=50,
+    ):
+        """
+        返回相对中心 (cx_rel, cy_rel)，范围严格在 [0, 1]
+
+        80% box附近:
+            0~48 px      : 40%
+            48~100 px    : 30%
+            100~200 px   : 30%
+
+        20% 全图随机
+        """
+
+        boxes = parse_boxes_from_xml(xml_path)
+
+        def sample_radius():
+            r = random.random()
+            if r < 0.4:
+                return random.uniform(0, 48)
+            elif r < 0.7:
+                return random.uniform(48, 100)
+            else:
+                return random.uniform(100, 200)
+
+        if len(boxes) > 0 and random.random() < box_near_prob:
+            xmin, ymin, xmax, ymax = random.choice(boxes)
+
+            box_cx = (xmin + xmax) * 0.5
+            box_cy = (ymin + ymax) * 0.5
+
+            cx, cy = box_cx, box_cy
+
+            for _ in range(max_retry):
+                radius = sample_radius()
+                theta = random.uniform(0, 2 * np.pi)
+
+                dx = radius * np.cos(theta)
+                dy = radius * np.sin(theta)
+
+                cand_x = box_cx + dx
+                cand_y = box_cy + dy
+
+                if 0 <= cand_x < image_w and 0 <= cand_y < image_h:
+                    cx, cy = cand_x, cand_y
+                    break
+            else:
+                # 极端情况兜底，保证不越界
+                cx = np.clip(cx, 0, image_w - 1)
+                cy = np.clip(cy, 0, image_h - 1)
+
+        else:
+            cx = random.uniform(0, image_w - 1)
+            cy = random.uniform(0, image_h - 1)
+
+        # 最后一层保险
+        cx = float(np.clip(cx, 0, image_w - 1))
+        cy = float(np.clip(cy, 0, image_h - 1))
+
+        cx_rel = cx / max(image_w - 1, 1)
+        cy_rel = cy / max(image_h - 1, 1)
+
+        return np.array([cx_rel, cy_rel], dtype=np.float32)   
+     
+    # 辅助函数：解析 XML，返回所有 box 的列表，每个 box 为 (xmin, ymin, xmax, ymax)
     def preprocess_images(examples):
         edits = examples[edited_image_column]
         box_urls = examples[box_column]
@@ -767,139 +847,108 @@ def main():
         processed_originals = []
         processed_masks = []
         processed_edits = []
-        processed_square_originals = []
+        processed_inpaint_masks = []
         processed_centers = []
- 
+
         for edit_path, box_path, mask_path in zip(edits, box_urls, masks):
             large_region_size = random.randint(768, 1280)
+
             orig, inpaint_mask = fill_box_with_mean_color(
                 box_path,
                 edit_path,
                 large_region_prob=0.7,
                 large_region_size=large_region_size,
             )
-            orig=orig.convert("RGB")
+
+            orig = orig.convert("RGB")
             edit = Image.open(edit_path).convert("RGB")
-            mask = Image.open(mask_path).convert("RGB")
+            mask = Image.open(mask_path)
+
+            if not isinstance(inpaint_mask, Image.Image):
+                inpaint_mask = Image.fromarray(inpaint_mask)
 
             assert orig.size == edit.size
             assert orig.size == mask.size
+            assert orig.size == inpaint_mask.size
 
-            w_img, h_img = orig.size
+            orig_w, orig_h = orig.size
+            new_w = (orig_w // 8) * 8
+            new_h = (orig_h // 8) * 8
 
-            BOX_GUIDE_PROB = 0.8
-            use_box_guide = random.random() < BOX_GUIDE_PROB
+            orig = orig.crop((0, 0, new_w, new_h))
+            edit = edit.crop((0, 0, new_w, new_h))
+            mask = mask.crop((0, 0, new_w, new_h))
+            inpaint_mask = inpaint_mask.crop((0, 0, new_w, new_h))
 
-            top, left, h, w = RandomCrop.get_params(
-                orig,
-                output_size=(args.resolution, args.resolution)
+            center = choose_relative_center_from_xml(
+                box_path,
+                image_w=new_w,
+                image_h=new_h,
+                box_near_prob=0.8,
             )
 
-            if use_box_guide:
-                boxes = parse_boxes_from_xml(box_path)
-                if boxes:
-                    xmin, ymin, xmax, ymax = random.choice(boxes)
+            orig_np = convert_to_np(orig)
+            edit_np = convert_to_np(edit)
 
-                    center_x = (xmin + xmax) / 2.0
-                    center_y = (ymin + ymax) / 2.0
+            mask_np = convert_to_np(mask)
+            mask_np = mask_np / 255.0
 
-                    search_radius_x = w_img * 0.1
-                    search_radius_y = h_img * 0.1
-
-                    offset_x = random.uniform(-search_radius_x, search_radius_x)
-                    offset_y = random.uniform(-search_radius_y, search_radius_y)
-
-                    target_cx = center_x + offset_x
-                    target_cy = center_y + offset_y
-
-                    left = int(target_cx - args.resolution / 2.0)
-                    top = int(target_cy - args.resolution / 2.0)
-
-                    left = max(0, min(left, w_img - args.resolution))
-                    top = max(0, min(top, h_img - args.resolution))
-
-            # 使用同一个 top / left 裁剪，保证四张图空间对齐
-            orig_cropped = Ft.crop(orig, top, left, args.resolution, args.resolution)
-            mask_cropped = Ft.crop(mask, top, left, args.resolution, args.resolution)
-            edit_cropped = Ft.crop(edit, top, left, args.resolution, args.resolution)
-
-            cx = (left + args.resolution / 2.0) / w_img
-            cy = (top + args.resolution / 2.0) / h_img
-            processed_centers.append([cx, cy])
-
-            max_side = max(w_img, h_img)
-            square_orig = Image.new("RGB", (max_side, max_side), (0, 0, 0))
-
-            offset_x = (max_side - w_img) // 2
-            offset_y = (max_side - h_img) // 2
-            square_orig.paste(orig, (offset_x, offset_y))
-
-            square_orig = square_orig.resize(
-                (args.resolution, args.resolution),
-                Image.Resampling.LANCZOS
-            )
-
-            orig_np = convert_to_np(orig_cropped, args.resolution)
-            mask_np = convert_to_np(mask_cropped, args.resolution)
-            edit_np = convert_to_np(edit_cropped, args.resolution)
-            square_np = convert_to_np(square_orig, args.resolution)
+            inpaint_mask_np = convert_to_np(inpaint_mask)
+            inpaint_mask_np = inpaint_mask_np / 255.0
 
             processed_originals.append(orig_np)
             processed_masks.append(mask_np)
             processed_edits.append(edit_np)
-            processed_square_originals.append(square_np)
+            processed_inpaint_masks.append(inpaint_mask_np)
+            processed_centers.append(center)
 
         original_images = np.stack(processed_originals)
         mask_images = np.stack(processed_masks)
         edited_images = np.stack(processed_edits)
-        square_images = np.stack(processed_square_originals)
+        inpaint_masks = np.stack(processed_inpaint_masks)
         centers = np.stack(processed_centers)
 
         images = np.stack([
             original_images,
-            mask_images,
             edited_images,
-            square_images
         ])
 
         images = torch.from_numpy(images)
         images = 2 * (images / 255.0) - 1
 
-        return images, torch.from_numpy(centers).float()
+        masks = torch.from_numpy(mask_images)
+        inpaint_masks = torch.from_numpy(inpaint_masks)
+        centers = torch.from_numpy(centers)
+
+        return images, masks, inpaint_masks, centers
     
     def preprocess_train(examples):
         # Preprocess images.
-        preprocessed_images, centers = preprocess_images(examples)
+        preprocessed_images, mask_images, inpaint_masks, centers = preprocess_images(examples)
 
         # 现在 preprocessed_images 包含四类图像：
         # [0] original_images: 修复输入图 crop
         # [1] mask_images:     mask crop
         # [2] edited_images:   目标图 crop
         # [3] square_images:   全局 square 图
-        original_images, mask_images, edited_images, square_images = preprocessed_images
+        original_images, edited_images = preprocessed_images
 
-        original_images = original_images.reshape(
-            -1, 3, args.resolution, args.resolution
-        )
-        mask_images = mask_images.reshape(
-            -1, 3, args.resolution, args.resolution
-        )
-        edited_images = edited_images.reshape(
-            -1, 3, args.resolution, args.resolution
-        )
-        square_images = square_images.reshape(
-            -1, 3, args.resolution, args.resolution
-        )
-
-        centers_position = centers.reshape(-1, 2)
+        # original_images = original_images.reshape(
+        #     -1, 3, args.resolution, args.resolution
+        # )
+        # mask_images = mask_images.reshape(
+        #     -1, 3, args.resolution, args.resolution
+        # )
+        # edited_images = edited_images.reshape(
+        #     -1, 3, args.resolution, args.resolution
+        # )
 
         # Collate the preprocessed images into the `examples`.
         examples["original_pixel_values"] = original_images
         examples["mask_pixel_values"] = mask_images
         examples["edited_pixel_values"] = edited_images
-        examples["square_pixel_values"] = square_images
-        examples["centers_position"] = centers_position
-
+        examples["inpaint_masks"] = inpaint_masks
+        examples["centers"] = centers
         # Preprocess the captions.
         captions = list(examples[edit_prompt_column])
         examples["input_ids"] = tokenize_captions(captions)
@@ -934,31 +983,27 @@ def main():
             memory_format=torch.contiguous_format
         ).float()
 
-        square_pixel_values = torch.stack(
-            [example["square_pixel_values"] for example in examples]
+        inpaint_masks = torch.stack(
+            [example["inpaint_masks"] for example in examples]
         )
-        square_pixel_values = square_pixel_values.to(
+        inpaint_masks = inpaint_masks.to(
             memory_format=torch.contiguous_format
         ).float()
-
-        center_position = torch.stack(
-            [example["centers_position"] for example in examples]
-        )
-        center_position = center_position.to(
-            memory_format=torch.contiguous_format
-        ).float()
-
         input_ids = torch.stack(
             [example["input_ids"] for example in examples]
         )
+        
+        centers = torch.stack(
+            [example["centers"] for example in examples]
+        ).float()
 
         return {
             "original_pixel_values": original_pixel_values,
             "mask_pixel_values": mask_pixel_values,
             "edited_pixel_values": edited_pixel_values,
-            "square_pixel_values": square_pixel_values,
-            "center_position": center_position,
+            "inpaint_masks": inpaint_masks,
             "input_ids": input_ids,
+            "centers": centers
         }
 
     # DataLoaders creation:
@@ -1068,6 +1113,136 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+        
+    def crop_latents_by_centers(
+        edited_latents_full,
+        original_latents_full,
+        centers,
+        crop_latent_size=64,
+    ):
+        """
+        根据输入 centers 从 edited / original latent 中裁同一个位置。
+
+        输入:
+            edited_latents_full:   B, 4, H, W
+            original_latents_full: B, 4, H, W
+            centers:              B, 2，相对中心坐标，范围 [0, 1]
+                                centers[:, 0] = cx_rel
+                                centers[:, 1] = cy_rel
+
+        输出:
+            edited_crop:   B, 4, crop_latent_size, crop_latent_size
+            original_crop: B, 4, crop_latent_size, crop_latent_size
+            crop_centers:  B, 2，实际裁剪窗口中心的相对坐标
+        """
+
+        bsz, _, h_lat, w_lat = edited_latents_full.shape
+
+        if h_lat < crop_latent_size or w_lat < crop_latent_size:
+            raise ValueError(
+                f"latent size too small: got H={h_lat}, W={w_lat}, "
+                f"but crop_latent_size={crop_latent_size}"
+            )
+
+        if centers.shape[0] != bsz or centers.shape[1] != 2:
+            raise ValueError(
+                f"centers shape should be [B, 2], got {centers.shape}"
+            )
+
+        centers = centers.to(
+            device=edited_latents_full.device,
+            dtype=edited_latents_full.dtype,
+        )
+
+        edited_crops = []
+        original_crops = []
+        actual_centers = []
+
+        half = crop_latent_size / 2.0
+
+        for i in range(bsz):
+            cx_rel = float(centers[i, 0].clamp(0, 1).item())
+            cy_rel = float(centers[i, 1].clamp(0, 1).item())
+
+            cx = cx_rel * w_lat
+            cy = cy_rel * h_lat
+
+            left = int(round(cx - half))
+            top = int(round(cy - half))
+
+            left = max(0, min(left, w_lat - crop_latent_size))
+            top = max(0, min(top, h_lat - crop_latent_size))
+
+            edited_crop = edited_latents_full[
+                i:i + 1,
+                :,
+                top:top + crop_latent_size,
+                left:left + crop_latent_size,
+            ]
+
+            original_crop = original_latents_full[
+                i:i + 1,
+                :,
+                top:top + crop_latent_size,
+                left:left + crop_latent_size,
+            ]
+
+            actual_cx = (left + crop_latent_size / 2.0) / w_lat
+            actual_cy = (top + crop_latent_size / 2.0) / h_lat
+
+            edited_crops.append(edited_crop)
+            original_crops.append(original_crop)
+            actual_centers.append([actual_cx, actual_cy])
+
+        edited_crops = torch.cat(edited_crops, dim=0)
+        original_crops = torch.cat(original_crops, dim=0)
+
+        actual_centers = torch.tensor(
+            actual_centers,
+            device=edited_latents_full.device,
+            dtype=edited_latents_full.dtype,
+        )
+
+        return edited_crops, original_crops, actual_centers
+
+    def crop_mask_by_centers(
+        mask_full,
+        centers,
+        crop_pixel_size=512,
+    ):
+        """
+        mask_full: B, 1, H, W
+        centers:   B, 2, 相对坐标 [0, 1], x/y
+        return:    B, 1, 512, 512
+        """
+
+        bsz, _, h, w = mask_full.shape
+        half = crop_pixel_size / 2.0
+        crops = []
+        centers = centers.to(device=mask_full.device, dtype=mask_full.dtype)
+        for i in range(bsz):
+            cx_rel = float(centers[i, 0].clamp(0, 1).item())
+            cy_rel = float(centers[i, 1].clamp(0, 1).item())
+
+            cx = cx_rel * w
+            cy = cy_rel * h
+
+            left = int(round(cx - half))
+            top = int(round(cy - half))
+
+            left = max(0, min(left, w - crop_pixel_size))
+            top = max(0, min(top, h - crop_pixel_size))
+
+            crop = mask_full[
+                i:i + 1,
+                :,
+                top:top + crop_pixel_size,
+                left:left + crop_pixel_size,
+            ]
+
+            crops.append(crop)
+
+        return torch.cat(crops, dim=0)
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -1083,49 +1258,68 @@ def main():
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
                 # So, first, convert images to latent space.
-                latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
 
+                latents_full = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
+                latents_full = latents_full * vae.config.scaling_factor
+
+                # Get the text embedding for conditioning.
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                # Get the additional image embedding for conditioning.
+                # Instead of getting a diagonal Gaussian here, we simply take the mode.
+                original_latents_full = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
+                original_latents_full = original_latents_full * vae.config.scaling_factor
+                centers = batch["centers"].to(weight_dtype)
+                latents, original_image_embeds, centers = crop_latents_by_centers(
+                    latents_full,
+                    original_latents_full,
+                    centers,
+                    crop_latent_size=64,
+                )
+                mask_full = batch["mask_pixel_values"].to(
+                    device=latents.device,
+                    dtype=weight_dtype,
+                )
+                mask_crop = crop_mask_by_centers(
+                    mask_full,
+                    centers,
+                    crop_pixel_size=512,
+                )
+                with accelerator.autocast():
+                    mask_image_embeds = unet.conv_in.project_mask_crop(mask_crop)
+
+                inpaint_masks = batch["inpaint_masks"].to(weight_dtype)
+                inpaint_mask_crop = crop_mask_by_centers(
+                    inpaint_masks,
+                    centers,
+                    crop_pixel_size=512,
+                )
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
-
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning.
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                # Get the additional image embedding for conditioning.
-                # Instead of getting a diagonal Gaussian here, we simply take the mode.
-                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
-
-                mask_image_embeds = vae.encode(batch["mask_pixel_values"].to(weight_dtype)).latent_dist.mode()
-
-                square_image_embeds = vae.encode(batch["square_pixel_values"].to(weight_dtype)).latent_dist.mode()
-                
-                center_position = batch["center_position"].to(
+                # centers: (B, 2) -> (B, 2, 1, 1) -> (B, 2, H_latent, W_latent)
+                center_maps = centers.to(
                     device=latents.device,
                     dtype=original_image_embeds.dtype,
-                )
-                
-                # center_position: (B, 2) -> (B, 2, 1, 1) -> (B, 2, H_latent, W_latent)
-                center_maps = center_position.view(bsz, 2, 1, 1).expand(
+                ).view(bsz, 2, 1, 1).expand(
                     bsz,
                     2,
                     noisy_latents.shape[2],
                     noisy_latents.shape[3],
                 )
-                
-                condition_embeds = torch.cat(
-                    [original_image_embeds, mask_image_embeds, square_image_embeds, center_maps],
-                    dim=1,
-                )
+                with accelerator.autocast():
+                    projected_global_latents = unet.conv_in.project_global_latents(original_image_embeds, original_latents_full, center_maps)
 
+                    condition_embeds = torch.cat(
+                        [original_image_embeds, mask_image_embeds, projected_global_latents, center_maps],
+                        dim=1,
+                    )
+                
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://huggingface.co/papers/2211.09800.
                 if args.conditioning_dropout_prob is not None:
@@ -1148,7 +1342,8 @@ def main():
                     condition_embeds = image_mask * condition_embeds
 
                 # Concatenate the `original_image_embeds` with the `noisy_latents`.
-                concatenated_noisy_latents = torch.cat([noisy_latents, condition_embeds], dim=1)
+                with accelerator.autocast():
+                    concatenated_noisy_latents = torch.cat([noisy_latents, condition_embeds], dim=1)
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1158,9 +1353,45 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+                with accelerator.autocast():
                 # Predict the noise residual and compute loss
-                model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                # 1. 把 512×512 的 mask 下采样到 latent 尺寸 64×64
+
+                #    mask 是二值图，所以必须用 nearest，不能用 bilinear。
+                inpaint_mask_64 = F.interpolate(
+                    inpaint_mask_crop,
+                    size=(64, 64),
+                    mode="nearest",
+                )
+                # 2. 扩展到和 model_pred / target 一样的通道数
+                #    model_pred: [B, 4, 64, 64]
+                #    inpaint_mask_64: [B, 1, 64, 64] -> [B, 4, 64, 64]
+                inpaint_mask_64 = inpaint_mask_64.expand_as(model_pred)
+                # 3. 构造权重
+                #    mask=0 的地方权重是 1
+                #    mask=1 的地方权重是 1 + repair_weight_alpha
+                repair_weight_alpha = 4.0
+                loss_weights = 1.0 + repair_weight_alpha * inpaint_mask_64.float()
+                loss_weights = loss_weights.float()
+                # 4. 逐像素 MSE
+                loss_map = F.mse_loss(
+                    model_pred.float(),
+                    target.float(),
+                    reduction="none",
+                )
+                # 5. weighted mean
+                if random.random() < 0.7:
+                    # 70% 使用mask加权
+                    loss = (loss_map * loss_weights).sum() / loss_weights.sum()
+                else:
+                    # 30% 普通MSE
+                    loss = F.mse_loss(
+                        model_pred.float(),
+                        target.float(),
+                        reduction="mean",
+                    )
+                # loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
