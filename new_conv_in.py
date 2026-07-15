@@ -331,8 +331,11 @@ class ContentAwarePositionGatedConvIn(nn.Module):
             # mask/global 是新条件，输入通道和原始 conv_in 不一致，不能 copy。
             # 这里建议初始化为 0，让它们从无影响开始学习。
             self.mask_branch.weight.zero_()
-            self.global_branch.weight.zero_()
-
+            nn.init.normal_(
+                self.global_branch.weight,
+                mean=0.0,
+                std=1e-3,
+            )
             # center 位置条件也从 0 开始学习。
             self.center_branch.weight.zero_()
 

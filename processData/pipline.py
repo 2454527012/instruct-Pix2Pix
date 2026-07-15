@@ -13,25 +13,27 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix
 )
 from diffusers.utils.torch_utils import randn_tensor
 
-from processData.pipline_14 import check_tensor
-
 
 class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
     """
-    完全按你的逻辑写的版本：
+    新版逻辑：
 
-    1. 先在像素空间把原图切成多个重叠 crop
-    2. 每个 crop 单独 VAE encode，得到 image_crop_latents，作为条件
-    3. 整图补黑边压缩到 crop_size，再 VAE encode，得到 square_image_latents，作为全局条件
-    4. 每个 crop 单独初始化自己的 noisy latent
-    5. 每一步 denoising：
-        - 每个 crop 自己 UNet 预测 noise
-        - 每个 crop 自己 scheduler.step，得到 next_crop_latent
-        - 所有 crop latent 的重叠区域平均
-        - 平均结果写回每个 crop latent
-    6. 最后每个 crop latent 单独 VAE decode
-    7. 在像素空间把所有 crop 拼回整图
-    8. 像素空间重叠区域再次平均
+    以前：
+        1. 像素空间切 crop
+        2. 每个 crop 单独 VAE encode
+        3. 每个 crop 单独 denoise
+        4. 每个 crop 单独 VAE decode
+        5. 像素空间拼图
+
+    现在：
+        1. 整张图先 VAE encode 成整图 latent
+        2. 初始化一张整图 noisy latent
+        3. 每一步 denoising 时，从整图 noisy latent 上切 latent crop
+        4. 每个 latent crop 单独 UNet 预测
+        5. scheduler.step 得到 next crop latent
+        6. 把所有 next crop latent 写回整图 latent
+        7. 重叠 latent 区域平均
+        8. 最后只对整图 latent 做一次 VAE decode
     """
 
     @torch.no_grad()
@@ -52,7 +54,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         output_type: str = "pil",
         return_dict: bool = True,
         callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["crop_latents"],
+        callback_on_step_end_tensor_inputs: list[str] = ["global_latents"],
         cross_attention_kwargs: dict[str, Any] | None = None,
         crop_process_batch_size: int = 8,
         **kwargs,
@@ -63,6 +65,9 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         if image is None:
             raise ValueError("`image` cannot be None.")
 
+        if mask is None:
+            raise ValueError("`mask` cannot be None，因为训练时使用了 mask 条件。")
+
         if crop_size % self.vae_scale_factor != 0:
             raise ValueError(f"crop_size={crop_size} 必须能被 {self.vae_scale_factor} 整除。")
 
@@ -71,10 +76,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
 
         if crop_overlap >= crop_size:
             raise ValueError("crop_overlap 必须小于 crop_size。")
-        
-        if mask is None:
-            raise ValueError("`mask` cannot be None，因为训练时使用了 mask 条件。")
-        
+
         self._guidance_scale = guidance_scale
         self._image_guidance_scale = image_guidance_scale
 
@@ -83,9 +85,9 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         # ------------------------------------------------------------
         # 1. batch size
         # ------------------------------------------------------------
-        if prompt is not None and isinstance(prompt, str):
+        if isinstance(prompt, str):
             batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
+        elif isinstance(prompt, list):
             batch_size = len(prompt)
         else:
             raise ValueError("这里建议直接传 prompt 字符串或 prompt list。")
@@ -93,15 +95,15 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         batch_size = batch_size * num_images_per_prompt
 
         if batch_size != 1:
-            raise ValueError("这版先按单张图推理写，batch_size 目前建议保持 1。")
+            raise ValueError("这版先按单张图推理写，batch_size 目前保持 1。")
 
         # ------------------------------------------------------------
         # 2. 文本编码
         #
-        # InstructPix2Pix CFG 会得到三份：
+        # InstructPix2Pix CFG 顺序：
         #   text condition
         #   image condition
-        #   uncondition
+        #   unconditional
         # ------------------------------------------------------------
         prompt_embeds = self._encode_prompt(
             prompt,
@@ -113,28 +115,23 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             negative_prompt_embeds=None,
         )
 
+        dtype = prompt_embeds.dtype
+
         # ------------------------------------------------------------
-        # 3. 原图预处理
+        # 3. 预处理整图 image
         #
         # image:
         #   [1, 3, H, W]
         #   range [-1, 1]
         # ------------------------------------------------------------
         image = self.image_processor.preprocess(image)
-        image = image.to(device=device, dtype=prompt_embeds.dtype)
-        mask_image = self.image_processor.preprocess(mask)
-        mask_image = mask_image.to(device=device, dtype=prompt_embeds.dtype)
+        image = image.to(device=device, dtype=dtype)
 
-        if mask_image.shape[-2:] != image.shape[-2:]:
-            raise ValueError(
-                f"mask_image 尺寸 {mask_image.shape[-2:]} 必须和 image 尺寸 {image.shape[-2:]} 一致。"
-            )
         _, _, pixel_h, pixel_w = image.shape
 
         if pixel_h < crop_size or pixel_w < crop_size:
             raise ValueError(
-                f"输入图像尺寸 {(pixel_h, pixel_w)} 小于 crop_size={crop_size}，"
-                f"请减小 crop_size 或放大输入图。"
+                f"输入图像尺寸 {(pixel_h, pixel_w)} 小于 crop_size={crop_size}。"
             )
 
         if pixel_h % self.vae_scale_factor != 0 or pixel_w % self.vae_scale_factor != 0:
@@ -142,15 +139,35 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 f"预处理后的图像尺寸 {(pixel_h, pixel_w)} 必须能被 {self.vae_scale_factor} 整除。"
             )
 
-        latent_crop_size = crop_size // self.vae_scale_factor
         latent_h = pixel_h // self.vae_scale_factor
         latent_w = pixel_w // self.vae_scale_factor
+        latent_crop_size = crop_size // self.vae_scale_factor
 
         # ------------------------------------------------------------
-        # 4. 像素空间生成 crop 窗口
+        # 4. 预处理 mask
+        #
+        # 这里不再用 VAE encode mask。
+        # 按你最新训练代码，mask crop 会进入：
+        #   unet.conv_in.project_mask_crop(mask_crop)
+        #
+        # mask_crop:
+        #   [N, 1, 512, 512]
+        #   range [0, 1]
+        # ------------------------------------------------------------
+        mask_image = self.preprocess_mask_to_tensor(
+            mask=mask,
+            height=pixel_h,
+            width=pixel_w,
+            device=device,
+            dtype=dtype,
+        )
+
+        # ------------------------------------------------------------
+        # 5. 生成像素窗口
         #
         # 注意：
-        #   这里的窗口是像素坐标，不是 latent 坐标。
+        #   窗口仍然用像素坐标保存。
+        #   后面切 latent 时再除以 vae_scale_factor。
         # ------------------------------------------------------------
         windows = self.get_adaptive_pixel_windows(
             image_h=pixel_h,
@@ -162,82 +179,61 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         num_crops = len(windows)
 
         # ------------------------------------------------------------
-        # 5. 构造整图压缩条件 square image
+        # 6. 整图 VAE encode
         #
-        # 这个对应你训练代码里的 square_orig。
-        # 它是全局条件，不随 timestep 变化。
+        # 这是新版最关键的第一处变化：
+        #
+        #   不再先切 image crop 再分别 VAE encode。
+        #   而是直接把整张 image 编码成：
+        #
+        #       original_latents_full: [1, 4, H/8, W/8]
+        #
+        # 后面每个 crop 的 image condition 都从这个整图 latent 上切。
         # ------------------------------------------------------------
-        square_image = self.make_square_image_tensor(
+        original_latents_full = self.encode_image_full_to_latents(
             image=image,
+            dtype=dtype,
+            device=device,
+        )
+
+        # ------------------------------------------------------------
+        # 7. 从整图 condition latent 上切出每个 crop 的 image condition
+        #
+        # image_crop_latents:
+        #   [N, 4, 64, 64]
+        # ------------------------------------------------------------
+        image_crop_latents = self.crop_latents_from_global(
+            global_latents=original_latents_full,
+            windows=windows,
+            latent_crop_size=latent_crop_size,
+        )
+
+        # ------------------------------------------------------------
+        # 8. 从整图 mask 上切 mask crop，然后通过训练时的投影层
+        #
+        # mask_crops:
+        #   [N, 1, 512, 512]
+        #
+        # mask_crop_latents:
+        #   [N, 4, 64, 64]
+        # ------------------------------------------------------------
+        mask_crops = self.crop_mask_from_global(
+            mask_image=mask_image,
+            windows=windows,
             crop_size=crop_size,
         )
 
-        square_image_latents = self.encode_image_to_latents(
-            image=square_image,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-        )
-
-        # square_image_latents: [3, 4, 64, 64]
-        # 每个 crop 都用同一个 square 条件，所以复制 num_crops 份
-        square_image_latents = self.repeat_cfg_tensor_for_crops(
-            square_image_latents,
-            num_crops=num_crops,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-        )
+        mask_crop_latents = self.unet.conv_in.project_mask_crop(mask_crops)
 
         # ------------------------------------------------------------
-        # 6. 先切像素 crop，再分别 VAE encode
+        # 9. center map
         #
-        # 这一步和你的训练代码一致：
-        #   orig_cropped = Ft.crop(...)
-        #   vae.encode(orig_cropped)
-        # ------------------------------------------------------------
-        image_crops = []
-        mask_crops = []
-
-        for win in windows:
-            top = win["pixel_top"]
-            left = win["pixel_left"]
-            crop = image[
-                :,
-                :,
-                top : top + crop_size,
-                left : left + crop_size,
-            ]
-            mask_crop = mask_image[
-                :,
-                :,
-                top : top + crop_size,
-                left : left + crop_size,
-            ]
-            image_crops.append(crop)
-            mask_crops.append(mask_crop)
-
-        image_crops = torch.cat(image_crops, dim=0)
-        mask_crops = torch.cat(mask_crops, dim=0)
-
-        # image_crop_latents:
-        #   no CFG: [num_crops, 4, 64, 64]
-        #   CFG:    [3*num_crops, 4, 64, 64]
-        image_crop_latents = self.encode_image_to_latents(
-            image=image_crops,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-        )
-        mask_crop_latents = self.encode_image_to_latents(
-            image=mask_crops,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-        )
-
-        # ------------------------------------------------------------
-        # 7. 为每个 crop 准备 center map
+        # center_maps:
+        #   [N, 2, 64, 64]
         #
-        # center map 也是条件，不随 timestep 变化。
+        # 和训练代码一致：
+        #   cx = crop center x / image_w
+        #   cy = crop center y / image_h
         # ------------------------------------------------------------
         center_maps = []
 
@@ -249,64 +245,115 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 image_h=pixel_h,
                 image_w=pixel_w,
                 latent_crop_size=latent_crop_size,
-                dtype=prompt_embeds.dtype,
+                dtype=dtype,
                 device=device,
-                do_classifier_free_guidance=False,
             )
             center_maps.append(cm)
 
-        # [num_crops, 2, 64, 64]
         center_maps = torch.cat(center_maps, dim=0)
 
-        if self.do_classifier_free_guidance:
-            uncond_center_maps = torch.zeros_like(center_maps)
-            center_maps = torch.cat(
-                [
-                    center_maps,
-                    center_maps,
-                    uncond_center_maps,
-                ],
-                dim=0,
+        # ------------------------------------------------------------
+        # 10. global condition 投影
+        #
+        # 对齐你最新训练代码里的：
+        #
+        #   projected_global_latents =
+        #       unet.conv_in.project_global_latents(
+        #           original_image_embeds,
+        #           original_latents_full,
+        #           center_maps
+        #       )
+        #
+        # projected_global_latents:
+        #   [N, 4, 64, 64]
+        # ------------------------------------------------------------
+        # projected_global_latents = self.unet.conv_in.project_global_latents(
+        #     image_crop_latents,
+        #     original_latents_full,
+        #     center_maps,
+        # )
+        projected_global_latents_list = []
+
+        for crop_index in range(num_crops):
+            projected_crop = self.unet.conv_in.project_global_latents(
+                image_crop_latents[crop_index:crop_index + 1],
+                original_latents_full,
+                center_maps[crop_index:crop_index + 1],
             )
 
+            projected_global_latents_list.append(projected_crop)
+
+        projected_global_latents = torch.cat(
+            projected_global_latents_list,
+            dim=0,
+        )
         # ------------------------------------------------------------
-        # 8. prompt_embeds 也要复制到每个 crop
+        # 11. CFG 条件扩展
         #
-        # 原本 prompt_embeds:
+        # 普通条件是 N 个 crop：
+        #   image_crop_latents
+        #   mask_crop_latents
+        #   projected_global_latents
+        #   center_maps
+        #
+        # CFG 后变成 3N：
+        #   text branch:  使用条件
+        #   image branch: 使用条件
+        #   uncond branch: 条件置零
+        # ------------------------------------------------------------
+        if self.do_classifier_free_guidance:
+            image_crop_latents = self.make_cfg_condition(image_crop_latents)
+            mask_crop_latents = self.make_cfg_condition(mask_crop_latents)
+            projected_global_latents = self.make_cfg_condition(projected_global_latents)
+            center_maps = self.make_cfg_condition(center_maps)
+
+        # ------------------------------------------------------------
+        # 12. prompt embeds 复制到每个 crop
+        #
+        # 原始：
         #   CFG: [3, seq, dim]
         #
-        # 现在每个 crop 都要一份：
-        #   CFG: [3*num_crops, seq, dim]
+        # 变成：
+        #   CFG: [3N, seq, dim]
         # ------------------------------------------------------------
         prompt_embeds = self.repeat_cfg_tensor_for_crops(
-            prompt_embeds,
+            tensor=prompt_embeds,
             num_crops=num_crops,
             do_classifier_free_guidance=self.do_classifier_free_guidance,
         )
 
         # ------------------------------------------------------------
-        # 9. 初始化每个 crop 自己的 noisy latent
+        # 13. 初始化整图 noisy latent
         #
-        # crop_latents:
-        #   [num_crops, 4, 64, 64]
+        # 这是新版最关键的第二处变化：
         #
-        # 注意：
-        #   这里没有整图 latent。
-        #   每个 crop 都有自己的 latent。
+        # 旧版：
+        #   crop_latents = [N, 4, 64, 64]
+        #
+        # 新版：
+        #   global_latents = [1, 4, H/8, W/8]
+        #
+        # 每一步 denoise 时临时从 global_latents 切 crop。
         # ------------------------------------------------------------
-        crop_latents = self.prepare_crop_latents(
-            windows=windows,
+        global_latents = self.prepare_global_latents(
             latent_h=latent_h,
             latent_w=latent_w,
             num_channels_latents=self.vae.config.latent_channels,
-            latent_crop_size=latent_crop_size,
-            dtype=prompt_embeds.dtype,
+            dtype=dtype,
             device=device,
             generator=generator,
         )
 
         # ------------------------------------------------------------
-        # 10. 通道检查
+        # 14. 通道检查
+        #
+        # 输入 UNet 的通道：
+        #   noisy latent              4
+        #   image condition           4
+        #   mask condition            4
+        #   projected global          4
+        #   center maps               2
+        #   total                    18
         # ------------------------------------------------------------
         total_channels = (
             self.vae.config.latent_channels
@@ -318,12 +365,12 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
 
         if total_channels != self.unet.config.in_channels:
             raise ValueError(
-                f"UNet 输入通道不匹配：当前 pipeline 构造 {total_channels} 通道，"
+                f"UNet 输入通道不匹配：pipeline 构造 {total_channels} 通道，"
                 f"但 unet.config.in_channels={self.unet.config.in_channels}。"
             )
 
         # ------------------------------------------------------------
-        # 11. scheduler
+        # 15. scheduler
         # ------------------------------------------------------------
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -333,71 +380,83 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # ------------------------------------------------------------
-        # 12. denoising loop
+        # 16. denoising loop
+        #
+        # 每一步流程：
+        #
+        #   global_latents
+        #       ↓ 切 latent crop
+        #   crop_latents
+        #       ↓ UNet 预测 noise
+        #   next_crop_latents
+        #       ↓ 写回整图 latent，重叠区域平均
+        #   global_latents
+        #
+        # 所以最后 global_latents 本身就是完整大图 latent。
         # ------------------------------------------------------------
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for step_index, t in enumerate(timesteps):
                 # ----------------------------------------------------
-                # 12.1 对所有 crop 做 CFG 扩展
+                # 16.1 从当前整图 latent 切出所有 crop latent
                 #
                 # crop_latents:
                 #   [N, 4, 64, 64]
+                # ----------------------------------------------------
+                crop_latents = self.crop_latents_from_global(
+                    global_latents=global_latents,
+                    windows=windows,
+                    latent_crop_size=latent_crop_size,
+                )
+
+                # ----------------------------------------------------
+                # 16.2 CFG 扩展
                 #
                 # latent_model_input:
                 #   [3N, 4, 64, 64]
                 # ----------------------------------------------------
                 if self.do_classifier_free_guidance:
                     latent_model_input = torch.cat(
-                        [
-                            crop_latents,
-                            crop_latents,
-                            crop_latents,
-                        ],
+                        [crop_latents, crop_latents, crop_latents],
                         dim=0,
                     )
                 else:
                     latent_model_input = crop_latents
 
-                check_tensor("crop_latents before scale", crop_latents)
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input,
                     t,
                 )
-                check_tensor("latent_model_input after scale", latent_model_input)
-                next_crop_latents_chunks = []
+
+                noise_pred_chunks = []
+                total_model_batch = latent_model_input.shape[0]
 
                 # ----------------------------------------------------
-                # 12.2 分批跑 UNet，避免 crop 太多时爆显存
+                # 16.3 分批跑 UNet
+                #
+                # 注意：
+                #   这里分批的是 3N 维度。
+                #   所以所有条件 tensor 都必须已经扩展到 3N。
                 # ----------------------------------------------------
-                total_model_batch = latent_model_input.shape[0]
-                
                 for start in range(0, total_model_batch, crop_process_batch_size):
                     end = min(start + crop_process_batch_size, total_model_batch)
 
                     latent_chunk = latent_model_input[start:end]
-                    mask_cond_chunk = mask_crop_latents[start:end]
                     image_cond_chunk = image_crop_latents[start:end]
-                    square_cond_chunk = square_image_latents[start:end]
+                    mask_cond_chunk = mask_crop_latents[start:end]
+                    global_cond_chunk = projected_global_latents[start:end]
                     center_chunk = center_maps[start:end]
                     prompt_chunk = prompt_embeds[start:end]
 
-                    check_tensor("latent_chunk", latent_chunk)
-                    check_tensor("image_cond_chunk", image_cond_chunk)
-                    check_tensor("square_cond_chunk", square_cond_chunk)
-                    check_tensor("center_chunk", center_chunk)
-                    check_tensor("prompt_chunk", prompt_chunk)
-                    check_tensor("mask_cond_chunk", mask_cond_chunk)
                     model_input = torch.cat(
                         [
                             latent_chunk,
                             image_cond_chunk,
                             mask_cond_chunk,
-                            square_cond_chunk,
+                            global_cond_chunk,
                             center_chunk,
                         ],
                         dim=1,
                     )
-                    check_tensor("model_input", model_input)
 
                     noise_pred_chunk = self.unet(
                         model_input,
@@ -406,19 +465,18 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                         cross_attention_kwargs=cross_attention_kwargs,
                         return_dict=False,
                     )[0]
-                    check_tensor("noise_pred_chunk", noise_pred_chunk)
 
-                    next_crop_latents_chunks.append(noise_pred_chunk)
+                    noise_pred_chunks.append(noise_pred_chunk)
 
-                crop_noise_pred = torch.cat(next_crop_latents_chunks, dim=0)
+                crop_noise_pred = torch.cat(noise_pred_chunks, dim=0)
 
                 # ----------------------------------------------------
-                # 12.3 InstructPix2Pix CFG
+                # 16.4 InstructPix2Pix CFG
                 #
                 # crop_noise_pred:
                 #   [3N, 4, 64, 64]
                 #
-                # 得到：
+                # 合成后：
                 #   [N, 4, 64, 64]
                 # ----------------------------------------------------
                 if self.do_classifier_free_guidance:
@@ -431,10 +489,14 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     )
 
                 # ----------------------------------------------------
-                # 12.4 每个 crop 单独 scheduler.step
+                # 16.5 对每个 crop 做 scheduler.step
                 #
-                # 这里输入的是每个 crop 自己当前的 latent。
-                # 输出是每个 crop 自己的 next latent。
+                # 输入：
+                #   crop_noise_pred: [N, 4, 64, 64]
+                #   crop_latents:    [N, 4, 64, 64]
+                #
+                # 输出：
+                #   next_crop_latents: [N, 4, 64, 64]
                 # ----------------------------------------------------
                 next_crop_latents = self.scheduler.step(
                     crop_noise_pred,
@@ -443,29 +505,29 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     **extra_step_kwargs,
                     return_dict=False,
                 )[0]
-                check_tensor("next_crop_latents", next_crop_latents)
+
                 # ----------------------------------------------------
-                # 12.5 关键：同步 crop latent 的重叠区域
+                # 16.6 把 next crop latent 拼回整图 latent
                 #
-                # 做法：
-                #   临时建立一个整图 latent 累加画布
-                #   把每个 crop latent 放到对应位置
-                #   重叠处求平均
-                #   再把平均结果切回每个 crop
+                # 这是新版最关键的第三处变化：
                 #
-                # 注意：
-                #   这不是生成整图 latent。
-                #   这只是为了让 crop 之间的重叠区域变成一致。
+                # 旧版：
+                #   crop_latents = next_crop_latents
+                #   最后 decode 每个 crop
+                #
+                # 新版：
+                #   global_latents = stitch_crop_latents_to_global(...)
+                #   下一步再从 global_latents 切 crop
+                #
+                # 重叠区域直接平均。
                 # ----------------------------------------------------
-                # crop_latents = self.sync_crop_latent_overlaps(
-                #     crop_latents=next_crop_latents,
-                #     windows=windows,
-                #     latent_h=latent_h,
-                #     latent_w=latent_w,
-                #     latent_crop_size=latent_crop_size,
-                # )
-                crop_latents = next_crop_latents
-                check_tensor("crop_latents after sync", crop_latents)
+                global_latents = self.stitch_crop_latents_to_global(
+                    crop_latents=next_crop_latents,
+                    windows=windows,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    latent_crop_size=latent_crop_size,
+                )
 
                 # callback
                 if callback_on_step_end is not None:
@@ -480,7 +542,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                         callback_kwargs,
                     )
 
-                    crop_latents = callback_outputs.pop("crop_latents", crop_latents)
+                    global_latents = callback_outputs.pop("global_latents", global_latents)
 
                 if step_index == len(timesteps) - 1 or (
                     (step_index + 1) > num_warmup_steps
@@ -489,69 +551,51 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     progress_bar.update()
 
                     if callback is not None and callback_steps is not None and step_index % callback_steps == 0:
-                        callback(step_index, t, crop_latents)
+                        callback(step_index, t, global_latents)
 
         # ------------------------------------------------------------
-        # 13. 每个 crop latent 单独 VAE decode
+        # 17. 最后只 decode 一次整图 latent
         #
-        # crop_images:
-        #   [num_crops, 3, crop_size, crop_size]
-        #   range 大致 [-1, 1]
+        # 旧版：
+        #   decode 每个 crop latent
+        #   stitch crop image
+        #
+        # 新版：
+        #   decode global_latents
+        #
+        # output_image_tensor:
+        #   [1, 3, H, W]
         # ------------------------------------------------------------
-        crop_images_list = []
-        decode_batch_size = 2  # 显存不够就改成 1
-
-        for start in range(0, crop_latents.shape[0], decode_batch_size):
-            end = min(start + decode_batch_size, crop_latents.shape[0])
-            crop_images_chunk = self.vae.decode(
-                crop_latents[start:end] / self.vae.config.scaling_factor,
+        if output_type != "latent":
+            output_image_tensor = self.vae.decode(
+                global_latents / self.vae.config.scaling_factor,
                 return_dict=False,
             )[0]
 
-            crop_images_list.append(crop_images_chunk)
-
-        crop_images = torch.cat(crop_images_list, dim=0)
-
-        # ------------------------------------------------------------
-        # 14. 像素空间拼接，并对重叠区域简单平均
-        #
-        # 这一步得到和原图尺寸一致的图片 tensor：
-        #   [1, 3, pixel_h, pixel_w]
-        # ------------------------------------------------------------
-        output_image_tensor = self.stitch_crop_images(
-            crop_images=crop_images,
-            windows=windows,
-            image_h=pixel_h,
-            image_w=pixel_w,
-            crop_size=crop_size,
-        )
-
-        # ------------------------------------------------------------
-        # 15. safety checker + postprocess
-        # ------------------------------------------------------------
-        if output_type != "latent":
             output_image_tensor, has_nsfw_concept = self.run_safety_checker(
                 output_image_tensor,
                 device,
-                prompt_embeds.dtype,
+                dtype,
             )
+
             if has_nsfw_concept is None:
                 do_denormalize = [True] * output_image_tensor.shape[0]
             else:
                 do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+
             images = self.image_processor.postprocess(
                 output_image_tensor,
                 output_type=output_type,
                 do_denormalize=do_denormalize,
             )
         else:
-            images = crop_latents
+            images = global_latents
             has_nsfw_concept = None
 
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (images, has_nsfw_concept)
+            return images, has_nsfw_concept
 
         return StableDiffusionPipelineOutput(
             images=images,
@@ -559,43 +603,395 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         )
 
     # ================================================================
-    # 工具函数 1：原图补黑边成正方形，再 resize
+    # mask 预处理
     # ================================================================
-    def make_square_image_tensor(self, image: torch.Tensor, crop_size: int):
+    def preprocess_mask_to_tensor(
+        self,
+        mask,
+        height: int,
+        width: int,
+        device,
+        dtype,
+    ):
         """
-        对应训练代码中的 square_orig。
+        把 mask 处理成训练代码里使用的格式：
+
+            [1, 1, H, W]
+            range [0, 1]
+
+        不使用 image_processor.preprocess，
+        因为 image_processor 会把图像归一化到 [-1, 1]，
+        但你的训练代码里 mask 是 mask_np / 255.0。
+        """
+
+        if isinstance(mask, PIL.Image.Image):
+            mask = mask.convert("L")
+            mask = mask.resize((width, height), resample=PIL.Image.NEAREST)
+
+            mask_tensor = torch.from_numpy(
+                __import__("numpy").array(mask)
+            ).float()
+
+            mask_tensor = mask_tensor / 255.0
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+
+        elif torch.is_tensor(mask):
+            mask_tensor = mask
+
+            if mask_tensor.ndim == 2:
+                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+            elif mask_tensor.ndim == 3:
+                mask_tensor = mask_tensor.unsqueeze(0)
+
+            if mask_tensor.shape[1] != 1:
+                mask_tensor = mask_tensor[:, :1]
+
+            mask_tensor = F.interpolate(
+                mask_tensor.float(),
+                size=(height, width),
+                mode="nearest",
+            )
+
+            if mask_tensor.max() > 1.0:
+                mask_tensor = mask_tensor / 255.0
+
+        else:
+            raise TypeError(f"暂时只支持 PIL.Image 或 torch.Tensor mask，当前类型：{type(mask)}")
+
+        return mask_tensor.to(device=device, dtype=dtype)
+
+    # ================================================================
+    # 整图 image -> 整图 latent
+    # ================================================================
+    def encode_image_full_to_latents(
+        self,
+        image: torch.Tensor,
+        dtype,
+        device,
+    ):
+        """
+        整张图一次性 VAE encode。
 
         输入：
             image: [1, 3, H, W], range [-1, 1]
 
         输出：
-            square: [1, 3, crop_size, crop_size]
+            latents: [1, 4, H/8, W/8]
+
+        注意：
+            这里乘 vae.config.scaling_factor，
+            和训练代码保持一致。
         """
 
-        b, c, h, w = image.shape
-        square_size = max(h, w)
+        image = image.to(device=device, dtype=dtype)
 
-        square = image.new_full(
-            (b, c, square_size, square_size),
-            -1.0,
+        latents = retrieve_latents(
+            self.vae.encode(image),
+            sample_mode="argmax",
         )
 
-        top = (square_size - h) // 2
-        left = (square_size - w) // 2
+        latents = latents * self.vae.config.scaling_factor
 
-        square[:, :, top : top + h, left : left + w] = image
-
-        square = F.interpolate(
-            square,
-            size=(crop_size, crop_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        return square
+        return latents
 
     # ================================================================
-    # 工具函数 2：像素空间自适应生成 crop 窗口
+    # 初始化整图 noisy latent
+    # ================================================================
+    def prepare_global_latents(
+        self,
+        latent_h: int,
+        latent_w: int,
+        num_channels_latents: int,
+        dtype,
+        device,
+        generator,
+    ):
+        """
+        初始化整图 noisy latent。
+
+        输出：
+            [1, 4, latent_h, latent_w]
+
+        之后每一步都从这张整图 latent 上切 crop。
+        """
+
+        shape = (
+            1,
+            num_channels_latents,
+            latent_h,
+            latent_w,
+        )
+
+        latents = randn_tensor(
+            shape,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+
+        latents = latents * self.scheduler.init_noise_sigma
+
+        return latents
+
+    # ================================================================
+    # 从整图 latent 上切 crop
+    # ================================================================
+    def crop_latents_from_global(
+        self,
+        global_latents: torch.Tensor,
+        windows: list[dict],
+        latent_crop_size: int,
+    ):
+        """
+        从整图 latent 上，根据像素窗口切出 latent crop。
+
+        global_latents:
+            [1, 4, H_lat, W_lat]
+
+        return:
+            [N, 4, latent_crop_size, latent_crop_size]
+        """
+
+        crops = []
+
+        for win in windows:
+            latent_top = win["pixel_top"] // self.vae_scale_factor
+            latent_left = win["pixel_left"] // self.vae_scale_factor
+
+            crop = global_latents[
+                :,
+                :,
+                latent_top : latent_top + latent_crop_size,
+                latent_left : latent_left + latent_crop_size,
+            ]
+
+            crops.append(crop)
+
+        return torch.cat(crops, dim=0)
+
+    # ================================================================
+    # 从整图 mask 上切 crop
+    # ================================================================
+    def crop_mask_from_global(
+        self,
+        mask_image: torch.Tensor,
+        windows: list[dict],
+        crop_size: int,
+    ):
+        """
+        从整图 mask 上切出像素级 mask crop。
+
+        mask_image:
+            [1, 1, H, W]
+
+        return:
+            [N, 1, crop_size, crop_size]
+        """
+
+        crops = []
+
+        for win in windows:
+            top = win["pixel_top"]
+            left = win["pixel_left"]
+
+            crop = mask_image[
+                :,
+                :,
+                top : top + crop_size,
+                left : left + crop_size,
+            ]
+
+            crops.append(crop)
+
+        return torch.cat(crops, dim=0)
+
+    # ================================================================
+    # crop latent 拼回整图 latent
+    # ================================================================
+    def stitch_crop_latents_to_global(
+        self,
+        crop_latents: torch.Tensor,
+        windows: list[dict],
+        latent_h: int,
+        latent_w: int,
+        latent_crop_size: int,
+    ):
+        """
+        把每个 crop latent 写回整图 latent。
+
+        重叠区域平均。
+
+        crop_latents:
+            [N, 4, latent_crop_size, latent_crop_size]
+
+        return:
+            [1, 4, latent_h, latent_w]
+        """
+
+        num_crops, channels, _, _ = crop_latents.shape
+        device = crop_latents.device
+        dtype = crop_latents.dtype
+
+        global_sum = torch.zeros(
+            1,
+            channels,
+            latent_h,
+            latent_w,
+            device=device,
+            dtype=dtype,
+        )
+
+        global_count = torch.zeros(
+            1,
+            1,
+            latent_h,
+            latent_w,
+            device=device,
+            dtype=dtype,
+        )
+
+        for idx, win in enumerate(windows):
+            latent_top = win["pixel_top"] // self.vae_scale_factor
+            latent_left = win["pixel_left"] // self.vae_scale_factor
+
+            global_sum[
+                :,
+                :,
+                latent_top : latent_top + latent_crop_size,
+                latent_left : latent_left + latent_crop_size,
+            ] += crop_latents[idx : idx + 1]
+
+            global_count[
+                :,
+                :,
+                latent_top : latent_top + latent_crop_size,
+                latent_left : latent_left + latent_crop_size,
+            ] += 1.0
+
+        global_latents = global_sum / global_count.clamp(min=1e-6)
+
+        return global_latents
+
+    # ================================================================
+    # 生成 CFG 条件
+    # ================================================================
+    def make_cfg_condition(self, tensor: torch.Tensor):
+        """
+        把普通条件 [N, C, H, W] 扩展成 CFG 条件：
+
+            [condition, condition, zero]
+
+        对应 InstructPix2Pix 的三路：
+            text branch
+            image branch
+            uncond branch
+        """
+
+        zero_tensor = torch.zeros_like(tensor)
+
+        return torch.cat(
+            [
+                tensor,
+                tensor,
+                zero_tensor,
+            ],
+            dim=0,
+        )
+
+    # ================================================================
+    # prompt CFG tensor 复制到每个 crop
+    # ================================================================
+    def repeat_cfg_tensor_for_crops(
+        self,
+        tensor: torch.Tensor,
+        num_crops: int,
+        do_classifier_free_guidance: bool,
+    ):
+        """
+        原始 prompt_embeds：
+
+            CFG:
+                [3, seq, dim]
+
+        复制后：
+
+            [3 * num_crops, seq, dim]
+
+        顺序必须保持：
+            text crops
+            image crops
+            uncond crops
+        """
+
+        if not do_classifier_free_guidance:
+            return tensor.repeat_interleave(num_crops, dim=0)
+
+        text_part, image_part, uncond_part = tensor.chunk(3, dim=0)
+
+        text_part = text_part.repeat_interleave(num_crops, dim=0)
+        image_part = image_part.repeat_interleave(num_crops, dim=0)
+        uncond_part = uncond_part.repeat_interleave(num_crops, dim=0)
+
+        return torch.cat(
+            [
+                text_part,
+                image_part,
+                uncond_part,
+            ],
+            dim=0,
+        )
+
+    # ================================================================
+    # center map
+    # ================================================================
+    def prepare_center_maps_for_pixel_window(
+        self,
+        pixel_top: int,
+        pixel_left: int,
+        crop_size: int,
+        image_h: int,
+        image_w: int,
+        latent_crop_size: int,
+        dtype,
+        device,
+    ):
+        """
+        生成当前 crop 的位置条件。
+
+        和训练代码里的 centers 对齐：
+
+            cx = crop中心点x / 整图宽度
+            cy = crop中心点y / 整图高度
+
+        输出：
+            [1, 2, latent_crop_size, latent_crop_size]
+        """
+
+        cx = (pixel_left + crop_size / 2.0) / image_w
+        cy = (pixel_top + crop_size / 2.0) / image_h
+
+        center_position = torch.tensor(
+            [[cx, cy]],
+            dtype=dtype,
+            device=device,
+        )
+
+        center_maps = center_position.view(
+            1,
+            2,
+            1,
+            1,
+        ).expand(
+            1,
+            2,
+            latent_crop_size,
+            latent_crop_size,
+        )
+
+        return center_maps
+
+    # ================================================================
+    # 像素空间窗口生成
     # ================================================================
     def get_adaptive_pixel_windows(
         self,
@@ -605,15 +1001,15 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         target_overlap: int,
     ):
         """
-        在像素空间生成 crop 坐标。
+        生成像素空间 crop 窗口。
 
-        目标：
-            1. crop_size 固定，比如 512
-            2. 重叠尽量接近 target_overlap，比如 128
-            3. 如果不能刚好 128，可以稍微大一点
-            4. 第一块贴左/上边
-            5. 最后一块贴右/下边
-            6. 完整覆盖原图
+        虽然新版是在 latent 空间切 crop，
+        但窗口仍然先用像素坐标描述。
+
+        好处：
+            1. crop_size / overlap 仍然直观，比如 512 / 128
+            2. mask crop 仍然可以直接用同一个窗口
+            3. latent crop 时只需要除以 vae_scale_factor
         """
 
         tops = self.get_adaptive_starts(
@@ -650,16 +1046,11 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         """
         生成一个方向上的 crop 起点。
 
-        例如：
-            length = 2592
-            crop = 512
-            target_overlap = 128
-
-        理想 stride:
-            512 - 128 = 384
-
-        如果不能整除，就自动调整 stride，
-        保证最后一个 crop 刚好贴到右边/下边。
+        目标：
+            1. 第一块贴边
+            2. 最后一块贴边
+            3. 完整覆盖
+            4. overlap 尽量接近 target_overlap
         """
 
         if length < crop:
@@ -675,8 +1066,6 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
 
         max_start = length - crop
 
-        # 用 ceil，保证实际 stride 不超过 target_stride
-        # 也就是实际 overlap 通常 >= target_overlap
         num_intervals = (max_start + target_stride - 1) // target_stride
         num_intervals = max(num_intervals, 1)
 
@@ -695,364 +1084,3 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             starts.append(max_start)
 
         return starts
-
-    # ================================================================
-    # 工具函数 3：image tensor -> VAE latent
-    # ================================================================
-    def encode_image_to_latents(
-        self,
-        image: torch.Tensor,
-        dtype,
-        device,
-        do_classifier_free_guidance: bool,
-    ):
-        """
-        输入：
-            image:
-                [N, 3, H, W] 或 [N, 4, H/8, W/8]
-
-        输出：
-            no CFG:
-                [N, 4, H/8, W/8]
-
-            CFG:
-                [3N, 4, H/8, W/8]
-                顺序是：
-                    image_latents
-                    image_latents
-                    zero_latents
-        """
-
-        image = image.to(device=device, dtype=dtype)
-
-        if image.shape[1] == 4:
-            image_latents = image
-        else:
-            image_latents = retrieve_latents(
-                self.vae.encode(image),
-                sample_mode="argmax",
-            )
-
-        if do_classifier_free_guidance:
-            zero_latents = torch.zeros_like(image_latents)
-
-            image_latents = torch.cat(
-                [
-                    image_latents,
-                    image_latents,
-                    zero_latents,
-                ],
-                dim=0,
-            )
-
-        return image_latents
-
-    # ================================================================
-    # 工具函数 4：复制 CFG tensor 到每个 crop
-    # ================================================================
-    def repeat_cfg_tensor_for_crops(
-        self,
-        tensor: torch.Tensor,
-        num_crops: int,
-        do_classifier_free_guidance: bool,
-    ):
-        """
-        原始 CFG tensor 是：
-            [3, ...]
-
-        现在有 num_crops 个 crop，需要变成：
-            [3*num_crops, ...]
-
-        并且顺序必须保持：
-            text crops
-            image crops
-            uncond crops
-        """
-
-        if not do_classifier_free_guidance:
-            return tensor.repeat_interleave(num_crops, dim=0)
-
-        text_part, image_part, uncond_part = tensor.chunk(3, dim=0)
-
-        text_part = text_part.repeat_interleave(num_crops, dim=0)
-        image_part = image_part.repeat_interleave(num_crops, dim=0)
-        uncond_part = uncond_part.repeat_interleave(num_crops, dim=0)
-
-        return torch.cat(
-            [
-                text_part,
-                image_part,
-                uncond_part,
-            ],
-            dim=0,
-        )
-
-    # ================================================================
-    # 工具函数 5：生成 center maps
-    # ================================================================
-    def prepare_center_maps_for_pixel_window(
-        self,
-        pixel_top: int,
-        pixel_left: int,
-        crop_size: int,
-        image_h: int,
-        image_w: int,
-        latent_crop_size: int,
-        dtype,
-        device,
-        do_classifier_free_guidance: bool,
-    ):
-        """
-        和训练代码对齐。
-
-        训练里：
-            cx = (left + resolution / 2) / w_img
-            cy = (top + resolution / 2) / h_img
-
-        这里一样，只是 top/left 来自推理时的 crop 窗口。
-        """
-
-        cx = (pixel_left + crop_size / 2.0) / image_w
-        cy = (pixel_top + crop_size / 2.0) / image_h
-
-        center_position = torch.tensor(
-            [[cx, cy]],
-            dtype=dtype,
-            device=device,
-        )
-
-        center_maps = center_position.view(
-            1,
-            2,
-            1,
-            1,
-        ).expand(
-            1,
-            2,
-            latent_crop_size,
-            latent_crop_size,
-        )
-
-        if do_classifier_free_guidance:
-            zero_maps = torch.zeros_like(center_maps)
-
-            center_maps = torch.cat(
-                [
-                    center_maps,
-                    center_maps,
-                    zero_maps,
-                ],
-                dim=0,
-            )
-
-        return center_maps
-
-    # ================================================================
-    # 工具函数 6：初始化每个 crop 的 noisy latent
-    # ================================================================
-    def prepare_crop_latents(
-        self,
-        windows,
-        latent_h: int,
-        latent_w: int,
-        num_channels_latents: int,
-        latent_crop_size: int,
-        dtype,
-        device,
-        generator,
-    ):
-        """
-        先生成整图 latent 噪声，再切出每个 crop latent。
-
-        这样一开始所有 crop 的重叠区域就是一致的。
-        """
-
-        global_shape = (
-            1,
-            num_channels_latents,
-            latent_h,
-            latent_w,
-        )
-
-        global_latents = randn_tensor(
-            global_shape,
-            generator=generator,
-            device=device,
-            dtype=dtype,
-        )
-
-        global_latents = global_latents * self.scheduler.init_noise_sigma
-
-        crop_latents = []
-
-        for win in windows:
-            latent_top = win["pixel_top"] // self.vae_scale_factor
-            latent_left = win["pixel_left"] // self.vae_scale_factor
-
-            crop = global_latents[
-                :,
-                :,
-                latent_top : latent_top + latent_crop_size,
-                latent_left : latent_left + latent_crop_size,
-            ]
-
-            crop_latents.append(crop)
-
-        crop_latents = torch.cat(crop_latents, dim=0)
-
-        return crop_latents
-    # ================================================================
-    # 工具函数 7：同步 crop latent 的重叠区域
-    # ================================================================
-    def sync_crop_latent_overlaps(
-        self,
-        crop_latents: torch.Tensor,
-        windows: list[dict],
-        latent_h: int,
-        latent_w: int,
-        latent_crop_size: int,
-    ):
-        """
-        让 crop latent 的重叠区域变成一样。
-
-        做法：
-            1. 临时创建一个整图 latent canvas
-            2. 把每个 crop latent 放到对应位置
-            3. 重叠处累加
-            4. 除以 count 得到平均
-            5. 再把平均后的区域切回每个 crop
-
-        结果：
-            如果两个 crop 有重叠区域，
-            那么同步后这两个 crop 的对应 latent 区域数值完全一样。
-        """
-
-        num_crops, channels, _, _ = crop_latents.shape
-        device = crop_latents.device
-        dtype = crop_latents.dtype
-
-        global_sum = torch.zeros(
-            1,
-            channels,
-            latent_h,
-            latent_w,
-            device=device,
-            dtype=dtype,
-        )
-
-        global_count = torch.zeros(
-            1,
-            1,
-            latent_h,
-            latent_w,
-            device=device,
-            dtype=dtype,
-        )
-
-        # 先把所有 crop 放到全局 latent 坐标里
-        for idx, win in enumerate(windows):
-            latent_top = win["pixel_top"] // self.vae_scale_factor
-            latent_left = win["pixel_left"] // self.vae_scale_factor
-
-            global_sum[
-                :,
-                :,
-                latent_top : latent_top + latent_crop_size,
-                latent_left : latent_left + latent_crop_size,
-            ] += crop_latents[idx : idx + 1]
-
-            global_count[
-                :,
-                :,
-                latent_top : latent_top + latent_crop_size,
-                latent_left : latent_left + latent_crop_size,
-            ] += 1.0
-
-        global_avg = global_sum / global_count.clamp(min=1e-6)
-
-        # 再把平均后的结果切回每个 crop
-        synced = torch.empty_like(crop_latents)
-
-        for idx, win in enumerate(windows):
-            latent_top = win["pixel_top"] // self.vae_scale_factor
-            latent_left = win["pixel_left"] // self.vae_scale_factor
-
-            synced[idx : idx + 1] = global_avg[
-                :,
-                :,
-                latent_top : latent_top + latent_crop_size,
-                latent_left : latent_left + latent_crop_size,
-            ]
-
-        return synced
-
-    # ================================================================
-    # 工具函数 8：最终像素空间拼接
-    # ================================================================
-    def stitch_crop_images(
-        self,
-        crop_images: torch.Tensor,
-        windows: list[dict],
-        image_h: int,
-        image_w: int,
-        crop_size: int,
-    ):
-        """
-        把 decode 出来的 crop image 拼回原图尺寸。
-
-        重叠区域简单平均。
-
-        crop_images:
-            [num_crops, 3, crop_size, crop_size]
-
-        输出：
-            [1, 3, image_h, image_w]
-        """
-
-        device = crop_images.device
-        dtype = crop_images.dtype
-
-        output_sum = torch.zeros(
-            1,
-            3,
-            image_h,
-            image_w,
-            device=device,
-            dtype=dtype,
-        )
-
-        output_count = torch.zeros(
-            1,
-            1,
-            image_h,
-            image_w,
-            device=device,
-            dtype=dtype,
-        )
-
-        for idx, win in enumerate(windows):
-            top = win["pixel_top"]
-            left = win["pixel_left"]
-
-            output_sum[
-                :,
-                :,
-                top : top + crop_size,
-                left : left + crop_size,
-            ] += crop_images[idx : idx + 1]
-
-            output_count[
-                :,
-                :,
-                top : top + crop_size,
-                left : left + crop_size,
-            ] += 1.0
-
-        output = output_sum / output_count.clamp(min=1e-6)
-
-        return output
-    
-def check_tensor(name, x):
-    if torch.isnan(x).any() or torch.isinf(x).any():
-        print(name, x.min(), x.max(), x.mean())
-        raise RuntimeError(f"{name} contains NaN or Inf")

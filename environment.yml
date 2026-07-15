@@ -119,6 +119,8 @@ dependencies:
       - tzdata==2026.2
       - urllib3==2.7.0
       - werkzeug==3.1.8
+      - xformers==0.0.29.post3
       - xxhash==3.7.0
       - yarl==1.24.2
       - zipp==4.1.0
+prefix: /root/autodl-tmp/conda_envs/ins
