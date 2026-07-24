@@ -603,7 +603,7 @@ def main():
             # 真正的 model.safetensors 会由 accelerator.load_state()
             # 在 hook 执行后自动加载。
 
-            model.register_to_config(in_channels=18)
+            model.register_to_config(in_channels=20)
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
 
@@ -837,7 +837,36 @@ def main():
         cy_rel = cy / max(image_h - 1, 1)
 
         return np.array([cx_rel, cy_rel], dtype=np.float32)   
-     
+
+    def choose_multiple_relative_centers_from_xml(
+        xml_path,
+        image_w,
+        image_h,
+        num_centers=8,
+        box_near_prob=0.8,
+    ):
+        """
+        调用原来的采样函数多次。
+
+        返回：
+            [num_centers, 2]
+        """
+        centers = []
+
+        for _ in range(num_centers):
+            center = choose_relative_center_from_xml(
+                xml_path=xml_path,
+                image_w=image_w,
+                image_h=image_h,
+                box_near_prob=box_near_prob,
+            )
+            centers.append(center)
+
+        return np.stack(centers, axis=0).astype(np.float32)
+        
+
+    num_crops_per_image = 8
+    
     # 辅助函数：解析 XML，返回所有 box 的列表，每个 box 为 (xmin, ymin, xmax, ymax)
     def preprocess_images(examples):
         edits = examples[edited_image_column]
@@ -856,7 +885,7 @@ def main():
             orig, inpaint_mask = fill_box_with_mean_color(
                 box_path,
                 edit_path,
-                large_region_prob=0.7,
+                large_region_prob=0.5,
                 large_region_size=large_region_size,
             )
 
@@ -880,11 +909,12 @@ def main():
             mask = mask.crop((0, 0, new_w, new_h))
             inpaint_mask = inpaint_mask.crop((0, 0, new_w, new_h))
 
-            center = choose_relative_center_from_xml(
-                box_path,
+            centers = choose_multiple_relative_centers_from_xml(
+                xml_path=box_path,
                 image_w=new_w,
                 image_h=new_h,
-                box_near_prob=0.8,
+                num_centers=num_crops_per_image,
+                box_near_prob=0.6,
             )
 
             orig_np = convert_to_np(orig)
@@ -900,7 +930,7 @@ def main():
             processed_masks.append(mask_np)
             processed_edits.append(edit_np)
             processed_inpaint_masks.append(inpaint_mask_np)
-            processed_centers.append(center)
+            processed_centers.append(centers)
 
         original_images = np.stack(processed_originals)
         mask_images = np.stack(processed_masks)
@@ -1039,6 +1069,8 @@ def main():
         unet, optimizer, train_dataloader, lr_scheduler
     )
 
+    unwrapped_unet = unwrap_model(unet)
+    
     if args.use_ema:
         ema_unet.to(accelerator.device)
 
@@ -1111,7 +1143,13 @@ def main():
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    # progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(
+        total=args.max_train_steps,
+        initial=global_step,
+        disable=not accelerator.is_local_main_process,
+    )
+    progress_bar.set_description("Steps")
     progress_bar.set_description("Steps")
         
     def crop_latents_by_centers(
@@ -1247,239 +1285,874 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
-            # Skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
 
+        if (
+            args.resume_from_checkpoint
+            and epoch == first_epoch
+            and resume_step > 0
+        ):
+            active_dataloader = accelerator.skip_first_batches(
+                train_dataloader,
+                resume_step,
+            )
+        else:
+            active_dataloader = train_dataloader
+
+
+        # for step, batch in enumerate(train_dataloader):
+            # 恢复训练时跳过已经完成的 dataloader step
+            # if (
+            #     args.resume_from_checkpoint
+            #     and epoch == first_epoch
+            #     and step < resume_step
+            # ):
+            #     if step % args.gradient_accumulation_steps == 0:
+            #         progress_bar.update(1)
+            #     continue
+
+
+        for step, batch in enumerate(
+            active_dataloader,
+            start=resume_step if epoch == first_epoch else 0,
+        ):
+            # =====================================================
+            # 1. 完整图片移到 GPU
+            # =====================================================
+
+            mask_full = batch[
+                "mask_pixel_values"
+            ].to(
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+
+            inpaint_masks_full = batch[
+                "inpaint_masks"
+            ].to(
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+
+            input_ids = batch["input_ids"].to(
+                accelerator.device
+            )
+
+            # [B, 4, 2]
+            all_centers = batch["centers"].to(
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+
+            full_bsz = mask_full.shape[0]
+
+            if all_centers.shape != (
+                full_bsz,
+                num_crops_per_image,
+                2,
+            ):
+                raise ValueError(
+                    f"centers shape should be "
+                    f"[B, {num_crops_per_image}, 2], "
+                    f"got {all_centers.shape}"
+                )
+
+            # =====================================================
+            # 2. 完整图片 VAE 编码一次
+            #
+            # edited 和 original 合并后，只调用一次 vae.encode。
+            # =====================================================
+            with torch.no_grad():
+                with accelerator.autocast():
+                    edited_pixel_values = batch[
+                        "edited_pixel_values"
+                    ].to(
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                    )
+
+                    latents_full = (
+                        vae.encode(edited_pixel_values)
+                        .latent_dist.sample()
+                        * vae.config.scaling_factor
+                    )
+
+                    del edited_pixel_values
+
+                    original_pixel_values = batch[
+                        "original_pixel_values"
+                    ].to(
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                    )
+
+                    original_latents_full = (
+                        vae.encode(original_pixel_values)
+                        .latent_dist.mode()
+                        * vae.config.scaling_factor
+                    )
+
+                    del original_pixel_values
+
+                    encoder_hidden_states_full = text_encoder(
+                        input_ids
+                    )[0]
+
+                    if args.conditioning_dropout_prob is not None:
+                        null_conditioning = text_encoder(
+                            tokenize_captions([""]).to(
+                                accelerator.device
+                            )
+                        )[0]
+                    else:
+                        null_conditioning = None
+
+                    # latents_full = (
+                    #     latents_full
+                    #     * vae.config.scaling_factor
+                    # )
+
+                    # original_latents_full = (
+                    #     original_latents_full
+                    #     * vae.config.scaling_factor
+                    # )
+
+                    # encoder_hidden_states_full = (
+                    #     text_encoder(input_ids)[0]
+                    # )
+
+                    # if (
+                    #     args.conditioning_dropout_prob
+                    #     is not None
+                    # ):
+                    #     null_conditioning = text_encoder(
+                    #         tokenize_captions([""]).to(
+                    #             accelerator.device
+                    #         )
+                    #     )[0]
+                    # else:
+                    #     null_conditioning = None
+
+            latents_full = latents_full.detach()
+            original_latents_full = (
+                original_latents_full.detach()
+            )
+            encoder_hidden_states_full = (
+                encoder_hidden_states_full.detach()
+            )
+
+            if null_conditioning is not None:
+                null_conditioning = (
+                    null_conditioning.detach()
+                )
+
+            # =====================================================
+            # 3. 当前两张图片，每张扩展成 4 个 crop
+            #
+            # B=2 时：
+            # [2, 4, 2] -> [8, 2]
+            # =====================================================
+            centers = all_centers.reshape(
+                full_bsz * num_crops_per_image,
+                2,
+            )
+
+            # 完整 latent 从 B 扩展到 B*4
+            latents_full_repeated = (
+                latents_full.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+            )
+
+            original_latents_full_repeated = (
+                original_latents_full.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+            )
+
+            encoder_hidden_states = (
+                encoder_hidden_states_full
+                .repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+            )
+
+            mask_full_repeated = (
+                mask_full.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+            )
+
+            inpaint_masks_repeated = (
+                inpaint_masks_full.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+            )
+
+            # =====================================================
+            # 4. 一次训练 8 个 crop
+            # =====================================================
             with accelerator.accumulate(unet):
-                # We want to learn the denoising process w.r.t the edited images which
-                # are conditioned on the original image (which was edited) and the edit instruction.
-                # So, first, convert images to latent space.
-
-                latents_full = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
-                latents_full = latents_full * vae.config.scaling_factor
-
-                # Get the text embedding for conditioning.
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                # Get the additional image embedding for conditioning.
-                # Instead of getting a diagonal Gaussian here, we simply take the mode.
-                original_latents_full = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
-                original_latents_full = original_latents_full * vae.config.scaling_factor
-                centers = batch["centers"].to(weight_dtype)
-                latents, original_image_embeds, centers = crop_latents_by_centers(
-                    latents_full,
-                    original_latents_full,
+                (
+                    latents,
+                    original_image_embeds,
+                    centers,
+                ) = crop_latents_by_centers(
+                    latents_full_repeated,
+                    original_latents_full_repeated,
                     centers,
                     crop_latent_size=64,
                 )
-                mask_full = batch["mask_pixel_values"].to(
-                    device=latents.device,
-                    dtype=weight_dtype,
-                )
-                mask_crop = crop_mask_by_centers(
-                    mask_full,
-                    centers,
-                    crop_pixel_size=512,
-                )
-                with accelerator.autocast():
-                    mask_image_embeds = unet.conv_in.project_mask_crop(mask_crop)
 
-                inpaint_masks = batch["inpaint_masks"].to(weight_dtype)
-                inpaint_mask_crop = crop_mask_by_centers(
-                    inpaint_masks,
-                    centers,
-                    crop_pixel_size=512,
-                )
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
+                # B=2 时，bsz=8
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                # centers: (B, 2) -> (B, 2, 1, 1) -> (B, 2, H_latent, W_latent)
+                with torch.no_grad():
+                    with accelerator.autocast():
+                        mask_crop = crop_mask_by_centers(
+                            mask_full_repeated,
+                            centers,
+                            crop_pixel_size=512,
+                        )
+                        mask_3ch = mask_crop.repeat(1, 3, 1, 1)
+                        mask_3ch = mask_3ch * 2.0 - 1.0
+                        # [B, 3, 512, 512] -> [B, 4, 64, 64]
+                        mask_image_embeds = (
+                            vae.encode(mask_3ch)
+                            .latent_dist.mode()
+                        )
+
+                        mask_image_embeds = (
+                            mask_image_embeds
+                            * vae.config.scaling_factor
+                        )
+                        
+                        del mask_3ch
+
+
+                inpaint_mask_crop = (
+                    crop_mask_by_centers(
+                        inpaint_masks_repeated,
+                        centers,
+                        crop_pixel_size=512,
+                    )
+                )
+
+                # 每个 crop 独立噪声
+                noise = torch.randn_like(latents)
+
+                timesteps = torch.randint(
+                    0,
+                    noise_scheduler.config
+                    .num_train_timesteps,
+                    (bsz,),
+                    device=latents.device,
+                ).long()
+
+                noisy_latents = (
+                    noise_scheduler.add_noise(
+                        latents,
+                        noise,
+                        timesteps,
+                    )
+                )
+
                 center_maps = centers.to(
                     device=latents.device,
                     dtype=original_image_embeds.dtype,
-                ).view(bsz, 2, 1, 1).expand(
+                ).view(
+                    bsz,
+                    2,
+                    1,
+                    1,
+                ).expand(
                     bsz,
                     2,
                     noisy_latents.shape[2],
                     noisy_latents.shape[3],
                 )
-                with accelerator.autocast():
-                    projected_global_latents = unet.conv_in.project_global_latents(original_image_embeds, original_latents_full, center_maps)
 
-                    condition_embeds = torch.cat(
-                        [original_image_embeds, mask_image_embeds, projected_global_latents, center_maps],
-                        dim=1,
-                    )
-                
-                # Conditioning dropout to support classifier-free guidance during inference. For more details
-                # check out the section 3.2.1 of the original paper https://huggingface.co/papers/2211.09800.
+                # =================================================
+                # Conditioning dropout
+                # =================================================
                 if args.conditioning_dropout_prob is not None:
-                    random_p = torch.rand(bsz, device=latents.device, generator=generator)
-                    # Sample masks for the edit prompts.
-                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob
-                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-                    # Final text conditioning.
-                    null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
-
-                    # Sample masks for the original images.
-                    image_mask_dtype = condition_embeds.dtype
-                    image_mask = 1 - (
-                        (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
-                        * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
+                    random_p = torch.rand(
+                        bsz,
+                        device=latents.device,
+                        generator=generator,
                     )
-                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
-                    # Final image conditioning.
-                    condition_embeds = image_mask * condition_embeds
 
-                # Concatenate the `original_image_embeds` with the `noisy_latents`.
-                with accelerator.autocast():
-                    concatenated_noisy_latents = torch.cat([noisy_latents, condition_embeds], dim=1)
+                    # -------------------------------------------------
+                    # 1. 文本条件 dropout
+                    # random_p < 2p 时，使用空文本条件
+                    # -------------------------------------------------
+                    prompt_mask = (
+                        random_p
+                        < 2 * args.conditioning_dropout_prob
+                    ).view(
+                        bsz,
+                        1,
+                        1,
+                    )
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
+                    encoder_hidden_states = torch.where(
+                        prompt_mask,
+                        null_conditioning.to(
+                            device=encoder_hidden_states.device,
+                            dtype=encoder_hidden_states.dtype,
+                        ),
+                        encoder_hidden_states,
+                    )
+
+                    # -------------------------------------------------
+                    # 2. 图像条件 dropout
+                    #
+                    # 原来：
+                    # condition_embeds = image_mask * condition_embeds
+                    #
+                    # 现在没有 condition_embeds，
+                    # 因此对每一种图像条件分别乘同一个 image_mask。
+                    # -------------------------------------------------
+                    image_mask = 1 - (
+                        (
+                            random_p
+                            >= args.conditioning_dropout_prob
+                        ).to(original_image_embeds.dtype)
+                        *
+                        (
+                            random_p
+                            < 3 * args.conditioning_dropout_prob
+                        ).to(original_image_embeds.dtype)
+                    )
+
+                    image_mask = image_mask.view(
+                        bsz,
+                        1,
+                        1,
+                        1,
+                    )
+
+                    original_image_embeds = (
+                        original_image_embeds * image_mask
+                    )
+
+                    mask_image_embeds = (
+                        mask_image_embeds
+                        * image_mask.to(mask_image_embeds.dtype)
+                    )
+
+                    original_latents_full_repeated = (
+                        original_latents_full_repeated
+                        * image_mask.to(
+                            original_latents_full_repeated.dtype
+                        )
+                    )
+
+                    center_maps = (
+                        center_maps
+                        * image_mask.to(center_maps.dtype)
+                    )
+
+
+                if (
+                    noise_scheduler.config.prediction_type
+                    == "epsilon"
+                ):
                     target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+
+                elif (
+                    noise_scheduler.config.prediction_type
+                    == "v_prediction"
+                ):
+                    target = (
+                        noise_scheduler.get_velocity(
+                            latents,
+                            noise,
+                            timesteps,
+                        )
+                    )
+
                 else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    raise ValueError(
+                        "Unknown prediction type "
+                        f"{noise_scheduler.config.prediction_type}"
+                    )
 
                 with accelerator.autocast():
-                # Predict the noise residual and compute loss
-                    model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-                # 1. 把 512×512 的 mask 下采样到 latent 尺寸 64×64
+                    unwrapped_unet.conv_in.set_condition_context(
+                        original_crop_latents=original_image_embeds,
+                        mask_embeds=mask_image_embeds,
+                        original_latents_full=original_latents_full_repeated,
+                        center_maps=center_maps,
+                    )
+                try:
+                    with accelerator.autocast():
+                        model_pred = unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states,
+                            return_dict=False,
+                        )[0]
 
-                #    mask 是二值图，所以必须用 nearest，不能用 bilinear。
+                finally:
+
+                    unwrapped_unet.conv_in.clear_condition_context()
+
+                # =================================================
+                # mask weighted loss
+                # =================================================
                 inpaint_mask_64 = F.interpolate(
-                    inpaint_mask_crop,
-                    size=(64, 64),
+                    inpaint_mask_crop.float(),
+                    size=model_pred.shape[-2:],
                     mode="nearest",
                 )
-                # 2. 扩展到和 model_pred / target 一样的通道数
-                #    model_pred: [B, 4, 64, 64]
-                #    inpaint_mask_64: [B, 1, 64, 64] -> [B, 4, 64, 64]
-                inpaint_mask_64 = inpaint_mask_64.expand_as(model_pred)
-                # 3. 构造权重
-                #    mask=0 的地方权重是 1
-                #    mask=1 的地方权重是 1 + repair_weight_alpha
+
+                inpaint_mask_64 = (
+                    inpaint_mask_64.expand_as(
+                        model_pred
+                    )
+                )
+
                 repair_weight_alpha = 4.0
-                loss_weights = 1.0 + repair_weight_alpha * inpaint_mask_64.float()
-                loss_weights = loss_weights.float()
-                # 4. 逐像素 MSE
+
+                loss_weights = (
+                    1.0
+                    + repair_weight_alpha
+                    * inpaint_mask_64.float()
+                )
+
                 loss_map = F.mse_loss(
                     model_pred.float(),
                     target.float(),
                     reduction="none",
                 )
-                # 5. weighted mean
+
                 if random.random() < 0.7:
-                    # 70% 使用mask加权
-                    loss = (loss_map * loss_weights).sum() / loss_weights.sum()
-                else:
-                    # 30% 普通MSE
-                    loss = F.mse_loss(
-                        model_pred.float(),
-                        target.float(),
-                        reduction="mean",
+                    loss = (
+                        loss_map
+                        * loss_weights
+                    ).sum() / (
+                        loss_weights.sum()
+                        .clamp_min(1e-8)
                     )
-                # loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    loss = loss_map.mean()
 
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                avg_loss = accelerator.gather(
+                    loss.detach().reshape(1)
+                ).mean()
 
-                # Backpropagate
+                train_loss += (
+                    avg_loss.item()
+                    / args.gradient_accumulation_steps
+                )
+
                 accelerator.backward(loss)
+
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(
+                        unet.parameters(),
+                        args.max_grad_norm,
+                    )
+
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
+            # =====================================================
+            # 当前 8 个 crop 完成一次更新
+            # =====================================================
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_unet.step(unet.parameters())
+                    ema_unet.step(
+                        unet.parameters()
+                    )
+
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+
+                accelerator.log(
+                    {
+                        "train_loss": train_loss,
+                        "crop_batch_size": bsz,
+                    },
+                    step=global_step,
+                )
+
                 train_loss = 0.0
 
-                if global_step % args.checkpointing_steps == 0:
+                if (
+                    global_step
+                    % args.checkpointing_steps
+                    == 0
+                ):
                     if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                        if (
+                            args.checkpoints_total_limit
+                            is not None
+                        ):
+                            checkpoints = [
+                                d
+                                for d in os.listdir(
+                                    args.output_dir
                                 )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                                if d.startswith(
+                                    "checkpoint"
+                                )
+                            ]
 
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
+                            checkpoints = sorted(
+                                checkpoints,
+                                key=lambda x: int(
+                                    x.split("-")[1]
+                                ),
+                            )
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                            if (
+                                len(checkpoints)
+                                >= args.checkpoints_total_limit
+                            ):
+                                num_to_remove = (
+                                    len(checkpoints)
+                                    - args.checkpoints_total_limit
+                                    + 1
+                                )
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+                                removing_checkpoints = (
+                                    checkpoints[
+                                        :num_to_remove
+                                    ]
+                                )
+
+                                for checkpoint_name in (
+                                    removing_checkpoints
+                                ):
+                                    shutil.rmtree(
+                                        os.path.join(
+                                            args.output_dir,
+                                            checkpoint_name,
+                                        )
+                                    )
+
+                        save_path = os.path.join(
+                            args.output_dir,
+                            f"checkpoint-{global_step}",
+                        )
+
+                        accelerator.save_state(
+                            save_path
+                        )
+
+                        logger.info(
+                            f"Saved state to "
+                            f"{save_path}"
+                        )
+
+            logs = {
+                "step_loss": loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "crop_batch": bsz,
+            }
+            
+            
+            
+            # =====================================================
+            # 当前 step 的 GPU Tensor 已经用完，释放 Python 引用
+            # =====================================================
+
+            del latents_full
+            del original_latents_full
+            del latents_full_repeated
+            del original_latents_full_repeated
+
+            del mask_full
+            del mask_full_repeated
+            del mask_crop
+            del mask_image_embeds
+
+            del inpaint_masks_full
+            del inpaint_masks_repeated
+            del inpaint_mask_crop
+            del inpaint_mask_64
+
+            del encoder_hidden_states_full
+            del encoder_hidden_states
+
+            if null_conditioning is not None:
+                del null_conditioning
+
+            del centers
+            del all_centers
+            del center_maps
+
+            del latents
+            del original_image_embeds
+            del noise
+            del noisy_latents
+            del timesteps
+
+            del target
+            del model_pred
+
+            del loss_weights
+            del loss_map
+            del loss
+            
+
+            progress_bar.set_postfix(
+                **logs
+            )
 
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if (
-                (args.val_image_url is not None)
-                and (args.validation_prompt is not None)
-                and (epoch % args.validation_epochs == 0)
-            ):
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
-                # The models need unwrapping because for compatibility in distributed training mode.
-                pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    unet=unwrap_model(unet),
-                    text_encoder=unwrap_model(text_encoder),
-                    vae=unwrap_model(vae),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
+        if global_step >= args.max_train_steps:
+            break
 
-                log_validation(
-                    pipeline,
-                    args,
-                    accelerator,
-                    generator,
-                )
+        # 后面继续放原来的 validation
 
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
 
-                del pipeline
-                torch.cuda.empty_cache()
+    # for epoch in range(first_epoch, args.num_train_epochs):
+    #     unet.train()
+    #     train_loss = 0.0
+    #     for step, batch in enumerate(train_dataloader):
+    #         # Skip steps until we reach the resumed step
+    #         if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+    #             if step % args.gradient_accumulation_steps == 0:
+    #                 progress_bar.update(1)
+    #             continue
+
+    #         with accelerator.accumulate(unet):
+    #             # We want to learn the denoising process w.r.t the edited images which
+    #             # are conditioned on the original image (which was edited) and the edit instruction.
+    #             # So, first, convert images to latent space.
+
+    #             latents_full = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
+    #             latents_full = latents_full * vae.config.scaling_factor
+
+    #             # Get the text embedding for conditioning.
+    #             encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+    #             # Get the additional image embedding for conditioning.
+    #             # Instead of getting a diagonal Gaussian here, we simply take the mode.
+    #             original_latents_full = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
+    #             original_latents_full = original_latents_full * vae.config.scaling_factor
+    #             centers = batch["centers"].to(weight_dtype)
+    #             latents, original_image_embeds, centers = crop_latents_by_centers(
+    #                 latents_full,
+    #                 original_latents_full,
+    #                 centers,
+    #                 crop_latent_size=64,
+    #             )
+    #             mask_full = batch["mask_pixel_values"].to(
+    #                 device=latents.device,
+    #                 dtype=weight_dtype,
+    #             )
+    #             mask_crop = crop_mask_by_centers(
+    #                 mask_full,
+    #                 centers,
+    #                 crop_pixel_size=512,
+    #             )
+    #             with accelerator.autocast():
+    #                 mask_image_embeds = unet.conv_in.project_mask_crop(mask_crop)
+
+    #             inpaint_masks = batch["inpaint_masks"].to(weight_dtype)
+    #             inpaint_mask_crop = crop_mask_by_centers(
+    #                 inpaint_masks,
+    #                 centers,
+    #                 crop_pixel_size=512,
+    #             )
+    #             # Sample noise that we'll add to the latents
+    #             noise = torch.randn_like(latents)
+    #             bsz = latents.shape[0]
+    #             # Sample a random timestep for each image
+    #             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+    #             timesteps = timesteps.long()
+    #             # Add noise to the latents according to the noise magnitude at each timestep
+    #             # (this is the forward diffusion process)
+    #             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+    #             # centers: (B, 2) -> (B, 2, 1, 1) -> (B, 2, H_latent, W_latent)
+    #             center_maps = centers.to(
+    #                 device=latents.device,
+    #                 dtype=original_image_embeds.dtype,
+    #             ).view(bsz, 2, 1, 1).expand(
+    #                 bsz,
+    #                 2,
+    #                 noisy_latents.shape[2],
+    #                 noisy_latents.shape[3],
+    #             )
+    #             with accelerator.autocast():
+    #                 projected_global_latents = unet.conv_in.project_global_latents(original_image_embeds, original_latents_full, center_maps)
+
+    #                 condition_embeds = torch.cat(
+    #                     [original_image_embeds, mask_image_embeds, projected_global_latents, center_maps],
+    #                     dim=1,
+    #                 )
+                
+    #             # Conditioning dropout to support classifier-free guidance during inference. For more details
+    #             # check out the section 3.2.1 of the original paper https://huggingface.co/papers/2211.09800.
+    #             if args.conditioning_dropout_prob is not None:
+    #                 random_p = torch.rand(bsz, device=latents.device, generator=generator)
+    #                 # Sample masks for the edit prompts.
+    #                 prompt_mask = random_p < 2 * args.conditioning_dropout_prob
+    #                 prompt_mask = prompt_mask.reshape(bsz, 1, 1)
+    #                 # Final text conditioning.
+    #                 null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
+    #                 encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
+
+    #                 # Sample masks for the original images.
+    #                 image_mask_dtype = condition_embeds.dtype
+    #                 image_mask = 1 - (
+    #                     (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
+    #                     * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
+    #                 )
+    #                 image_mask = image_mask.reshape(bsz, 1, 1, 1)
+    #                 # Final image conditioning.
+    #                 condition_embeds = image_mask * condition_embeds
+
+    #             # Concatenate the `original_image_embeds` with the `noisy_latents`.
+    #             with accelerator.autocast():
+    #                 concatenated_noisy_latents = torch.cat([noisy_latents, condition_embeds], dim=1)
+
+    #             # Get the target for loss depending on the prediction type
+    #             if noise_scheduler.config.prediction_type == "epsilon":
+    #                 target = noise
+    #             elif noise_scheduler.config.prediction_type == "v_prediction":
+    #                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    #             else:
+    #                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+    #             with accelerator.autocast():
+    #             # Predict the noise residual and compute loss
+    #                 model_pred = unet(concatenated_noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+    #             # 1. 把 512×512 的 mask 下采样到 latent 尺寸 64×64
+
+    #             #    mask 是二值图，所以必须用 nearest，不能用 bilinear。
+    #             inpaint_mask_64 = F.interpolate(
+    #                 inpaint_mask_crop,
+    #                 size=(64, 64),
+    #                 mode="nearest",
+    #             )
+    #             # 2. 扩展到和 model_pred / target 一样的通道数
+    #             #    model_pred: [B, 4, 64, 64]
+    #             #    inpaint_mask_64: [B, 1, 64, 64] -> [B, 4, 64, 64]
+    #             inpaint_mask_64 = inpaint_mask_64.expand_as(model_pred)
+    #             # 3. 构造权重
+    #             #    mask=0 的地方权重是 1
+    #             #    mask=1 的地方权重是 1 + repair_weight_alpha
+    #             repair_weight_alpha = 4.0
+    #             loss_weights = 1.0 + repair_weight_alpha * inpaint_mask_64.float()
+    #             loss_weights = loss_weights.float()
+    #             # 4. 逐像素 MSE
+    #             loss_map = F.mse_loss(
+    #                 model_pred.float(),
+    #                 target.float(),
+    #                 reduction="none",
+    #             )
+    #             # 5. weighted mean
+    #             if random.random() < 0.7:
+    #                 # 70% 使用mask加权
+    #                 loss = (loss_map * loss_weights).sum() / loss_weights.sum()
+    #             else:
+    #                 # 30% 普通MSE
+    #                 loss = F.mse_loss(
+    #                     model_pred.float(),
+    #                     target.float(),
+    #                     reduction="mean",
+    #                 )
+    #             # loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+    #             # Gather the losses across all processes for logging (if we use distributed training).
+    #             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+    #             train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+    #             # Backpropagate
+    #             accelerator.backward(loss)
+    #             if accelerator.sync_gradients:
+    #                 accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+    #             optimizer.step()
+    #             lr_scheduler.step()
+    #             optimizer.zero_grad()
+
+    #         # Checks if the accelerator has performed an optimization step behind the scenes
+    #         if accelerator.sync_gradients:
+    #             if args.use_ema:
+    #                 ema_unet.step(unet.parameters())
+    #             progress_bar.update(1)
+    #             global_step += 1
+    #             accelerator.log({"train_loss": train_loss}, step=global_step)
+    #             train_loss = 0.0
+
+    #             if global_step % args.checkpointing_steps == 0:
+    #                 if accelerator.is_main_process:
+    #                     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+    #                     if args.checkpoints_total_limit is not None:
+    #                         checkpoints = os.listdir(args.output_dir)
+    #                         checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+    #                         checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+    #                         # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+    #                         if len(checkpoints) >= args.checkpoints_total_limit:
+    #                             num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+    #                             removing_checkpoints = checkpoints[0:num_to_remove]
+
+    #                             logger.info(
+    #                                 f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+    #                             )
+    #                             logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+    #                             for removing_checkpoint in removing_checkpoints:
+    #                                 removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+    #                                 shutil.rmtree(removing_checkpoint)
+
+    #                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+    #                     accelerator.save_state(save_path)
+    #                     logger.info(f"Saved state to {save_path}")
+
+    #         logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+    #         progress_bar.set_postfix(**logs)
+
+    #         if global_step >= args.max_train_steps:
+    #             break
+
+    #     if accelerator.is_main_process:
+    #         if (
+    #             (args.val_image_url is not None)
+    #             and (args.validation_prompt is not None)
+    #             and (epoch % args.validation_epochs == 0)
+    #         ):
+    #             if args.use_ema:
+    #                 # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+    #                 ema_unet.store(unet.parameters())
+    #                 ema_unet.copy_to(unet.parameters())
+    #             # The models need unwrapping because for compatibility in distributed training mode.
+    #             pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+    #                 args.pretrained_model_name_or_path,
+    #                 unet=unwrap_model(unet),
+    #                 text_encoder=unwrap_model(text_encoder),
+    #                 vae=unwrap_model(vae),
+    #                 revision=args.revision,
+    #                 variant=args.variant,
+    #                 torch_dtype=weight_dtype,
+    #             )
+
+    #             log_validation(
+    #                 pipeline,
+    #                 args,
+    #                 accelerator,
+    #                 generator,
+    #             )
+
+    #             if args.use_ema:
+    #                 # Switch back to the original UNet parameters.
+    #                 ema_unet.restore(unet.parameters())
+
+    #             del pipeline
+    #             torch.cuda.empty_cache()
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()

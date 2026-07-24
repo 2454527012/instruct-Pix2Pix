@@ -223,8 +223,12 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             crop_size=crop_size,
         )
 
-        mask_crop_latents = self.unet.conv_in.project_mask_crop(mask_crops)
-
+        mask_crop_latents = self.encode_mask_crops_to_latents(
+            mask_crops=mask_crops,
+            dtype=dtype,
+            device=device,
+            encode_batch_size=crop_process_batch_size,
+        )
         # ------------------------------------------------------------
         # 9. center map
         #
@@ -252,41 +256,13 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
 
         center_maps = torch.cat(center_maps, dim=0)
 
-        # ------------------------------------------------------------
-        # 10. global condition 投影
-        #
-        # 对齐你最新训练代码里的：
-        #
-        #   projected_global_latents =
-        #       unet.conv_in.project_global_latents(
-        #           original_image_embeds,
-        #           original_latents_full,
-        #           center_maps
-        #       )
-        #
-        # projected_global_latents:
-        #   [N, 4, 64, 64]
-        # ------------------------------------------------------------
-        # projected_global_latents = self.unet.conv_in.project_global_latents(
-        #     image_crop_latents,
-        #     original_latents_full,
-        #     center_maps,
-        # )
-        projected_global_latents_list = []
-
-        for crop_index in range(num_crops):
-            projected_crop = self.unet.conv_in.project_global_latents(
-                image_crop_latents[crop_index:crop_index + 1],
-                original_latents_full,
-                center_maps[crop_index:crop_index + 1],
-            )
-
-            projected_global_latents_list.append(projected_crop)
-
-        projected_global_latents = torch.cat(
-            projected_global_latents_list,
-            dim=0,
+        original_latents_full_per_crop = original_latents_full.expand(
+            num_crops,
+            -1,
+            -1,
+            -1,
         )
+
         # ------------------------------------------------------------
         # 11. CFG 条件扩展
         #
@@ -302,10 +278,18 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         #   uncond branch: 条件置零
         # ------------------------------------------------------------
         if self.do_classifier_free_guidance:
-            image_crop_latents = self.make_cfg_condition(image_crop_latents)
-            mask_crop_latents = self.make_cfg_condition(mask_crop_latents)
-            projected_global_latents = self.make_cfg_condition(projected_global_latents)
-            center_maps = self.make_cfg_condition(center_maps)
+            image_crop_latents = self.make_cfg_condition(
+                image_crop_latents
+            )
+            mask_crop_latents = self.make_cfg_condition(
+                mask_crop_latents
+            )
+            original_latents_full_per_crop = self.make_cfg_condition(
+                original_latents_full_per_crop
+            )
+            center_maps = self.make_cfg_condition(
+                center_maps
+            )
 
         # ------------------------------------------------------------
         # 12. prompt embeds 复制到每个 crop
@@ -345,28 +329,16 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         )
 
         # ------------------------------------------------------------
-        # 14. 通道检查
-        #
-        # 输入 UNet 的通道：
-        #   noisy latent              4
-        #   image condition           4
-        #   mask condition            4
-        #   projected global          4
-        #   center maps               2
-        #   total                    18
+        # 14. 动态通道检查
         # ------------------------------------------------------------
-        total_channels = (
-            self.vae.config.latent_channels
-            + 4
-            + 4
-            + 4
-            + 2
-        )
-
-        if total_channels != self.unet.config.in_channels:
+        expected_in_channels = self.vae.config.latent_channels
+        if self.unet.config.in_channels != expected_in_channels:
             raise ValueError(
-                f"UNet 输入通道不匹配：pipeline 构造 {total_channels} 通道，"
-                f"但 unet.config.in_channels={self.unet.config.in_channels}。"
+                "新版 UNet 输入通道不匹配：\n"
+                f"  noisy latent channels: {expected_in_channels}\n"
+                f"  unet.config.in_channels: {self.unet.config.in_channels}\n"
+                "新版 ContentAwarePositionGatedConvIn "
+                "应将 unet.config.in_channels 注册为 4。"
             )
 
         # ------------------------------------------------------------
@@ -437,36 +409,69 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 #   这里分批的是 3N 维度。
                 #   所以所有条件 tensor 都必须已经扩展到 3N。
                 # ----------------------------------------------------
-                for start in range(0, total_model_batch, crop_process_batch_size):
-                    end = min(start + crop_process_batch_size, total_model_batch)
-
-                    latent_chunk = latent_model_input[start:end]
-                    image_cond_chunk = image_crop_latents[start:end]
-                    mask_cond_chunk = mask_crop_latents[start:end]
-                    global_cond_chunk = projected_global_latents[start:end]
-                    center_chunk = center_maps[start:end]
-                    prompt_chunk = prompt_embeds[start:end]
-
-                    model_input = torch.cat(
-                        [
-                            latent_chunk,
-                            image_cond_chunk,
-                            mask_cond_chunk,
-                            global_cond_chunk,
-                            center_chunk,
-                        ],
-                        dim=1,
+                for start in range(
+                    0,
+                    total_model_batch,
+                    crop_process_batch_size,
+                ):
+                    end = min(
+                        start + crop_process_batch_size,
+                        total_model_batch,
                     )
 
-                    noise_pred_chunk = self.unet(
-                        model_input,
-                        t,
-                        encoder_hidden_states=prompt_chunk,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        return_dict=False,
-                    )[0]
+                    # ----------------------------------------------------
+                    # 当前分块的所有输入
+                    # ----------------------------------------------------
+                    latent_chunk = latent_model_input[start:end]
 
-                    noise_pred_chunks.append(noise_pred_chunk)
+                    image_cond_chunk = image_crop_latents[start:end]
+
+                    mask_cond_chunk = mask_crop_latents[start:end]
+
+                    full_latent_chunk = (
+                        original_latents_full_per_crop[start:end]
+                    )
+
+                    center_chunk = center_maps[start:end]
+
+                    prompt_chunk = prompt_embeds[start:end]
+
+                    # ----------------------------------------------------
+                    # 把当前 chunk 的条件临时保存到 conv_in
+                    #
+                    # 此处只保存 Tensor 引用，不执行可训练计算。
+                    # global_projector 会在 conv_in.forward() 内执行。
+                    # ----------------------------------------------------
+                    
+                    self.unet.conv_in.set_condition_context(
+                        original_crop_latents=image_cond_chunk,
+                        mask_embeds=mask_cond_chunk,
+                        original_latents_full=full_latent_chunk,
+                        center_maps=center_chunk,
+                    )
+
+                    try:
+                        # ------------------------------------------------
+                        # 新版 UNet 只直接接收4通道 noisy latent
+                        #
+                        # 不再构造20通道 model_input。
+                        # ------------------------------------------------
+                        noise_pred_chunk = self.unet(
+                            latent_chunk,
+                            t,
+                            encoder_hidden_states=prompt_chunk,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            return_dict=False,
+                        )[0]
+
+                    finally:
+                        # 防止长期持有 Tensor 或计算图引用。
+                        # 即使 UNet forward 报错，也会执行清理。
+                        self.unet.conv_in.clear_condition_context()
+
+                    noise_pred_chunks.append(
+                        noise_pred_chunk
+                    )
 
                 crop_noise_pred = torch.cat(noise_pred_chunks, dim=0)
 
@@ -614,51 +619,192 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         dtype,
     ):
         """
-        把 mask 处理成训练代码里使用的格式：
+        把 mask 转成与训练代码一致的格式：
 
-            [1, 1, H, W]
-            range [0, 1]
+            shape: [1, 1, H, W]
+            range: [0, 1]
 
-        不使用 image_processor.preprocess，
-        因为 image_processor 会把图像归一化到 [-1, 1]，
-        但你的训练代码里 mask 是 mask_np / 255.0。
+        不进行 [-1,1] 归一化。
+        [-1,1] 转换放在 VAE 编码前完成。
         """
 
         if isinstance(mask, PIL.Image.Image):
             mask = mask.convert("L")
-            mask = mask.resize((width, height), resample=PIL.Image.NEAREST)
+
+            mask = mask.resize(
+                (width, height),
+                resample=PIL.Image.Resampling.NEAREST,
+            )
+
+            import numpy as np
+
+            mask_array = np.asarray(
+                mask,
+                dtype=np.float32,
+            )
 
             mask_tensor = torch.from_numpy(
-                __import__("numpy").array(mask)
-            ).float()
+                mask_array
+            )[None, None]
 
             mask_tensor = mask_tensor / 255.0
-            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
 
         elif torch.is_tensor(mask):
-            mask_tensor = mask
+            mask_tensor = mask.detach().float()
 
             if mask_tensor.ndim == 2:
-                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
-            elif mask_tensor.ndim == 3:
-                mask_tensor = mask_tensor.unsqueeze(0)
+                # [H,W] -> [1,1,H,W]
+                mask_tensor = mask_tensor[None, None]
 
+            elif mask_tensor.ndim == 3:
+                # 支持 [C,H,W]
+                if mask_tensor.shape[0] in (1, 3, 4):
+                    mask_tensor = mask_tensor[None]
+
+                # 支持 [H,W,C]
+                elif mask_tensor.shape[-1] in (1, 3, 4):
+                    mask_tensor = mask_tensor.permute(
+                        2,
+                        0,
+                        1,
+                    )[None]
+
+                else:
+                    raise ValueError(
+                        f"无法判断三维 mask 的通道位置：{mask_tensor.shape}"
+                    )
+
+            elif mask_tensor.ndim != 4:
+                raise ValueError(
+                    f"mask Tensor 应为 2/3/4 维，实际为 {mask_tensor.shape}"
+                )
+
+            if mask_tensor.shape[0] != 1:
+                raise ValueError(
+                    "当前推理代码只支持单张 mask，"
+                    f"实际 batch={mask_tensor.shape[0]}"
+                )
+
+            # RGB/RGBA mask 只取一个通道
             if mask_tensor.shape[1] != 1:
                 mask_tensor = mask_tensor[:, :1]
 
+            if mask_tensor.max().item() > 1.0:
+                mask_tensor = mask_tensor / 255.0
+
             mask_tensor = F.interpolate(
-                mask_tensor.float(),
+                mask_tensor,
                 size=(height, width),
                 mode="nearest",
             )
 
-            if mask_tensor.max() > 1.0:
-                mask_tensor = mask_tensor / 255.0
-
         else:
-            raise TypeError(f"暂时只支持 PIL.Image 或 torch.Tensor mask，当前类型：{type(mask)}")
+            raise TypeError(
+                "mask 目前只支持 PIL.Image 或 torch.Tensor，"
+                f"实际类型为 {type(mask)}"
+            )
 
-        return mask_tensor.to(device=device, dtype=dtype)
+        mask_tensor = mask_tensor.clamp(
+            0.0,
+            1.0,
+        )
+
+        return mask_tensor.to(
+            device=device,
+            dtype=dtype,
+        )
+    # ================================================================
+    # mask crop -> mask latent
+    # ================================================================
+    def encode_mask_crops_to_latents(
+        self,
+        mask_crops: torch.Tensor,
+        dtype,
+        device,
+        encode_batch_size: int = 8,
+    ):
+        """
+        与训练代码中的 mask 编码过程完全一致。
+
+        输入：
+            mask_crops:
+                [N, 1, H, W]
+                range [0, 1]
+
+        处理：
+            1. 重复成三通道
+            2. 从 [0,1] 映射到 [-1,1]
+            3. 使用 VAE 编码
+            4. 使用 latent distribution 的 mode
+            5. 乘一次 vae.config.scaling_factor
+
+        输出：
+            mask_latents:
+                [N, 4, H/8, W/8]
+        """
+
+        if mask_crops.ndim != 4:
+            raise ValueError(
+                f"mask_crops 应为 [N,1,H,W]，实际为 {mask_crops.shape}"
+            )
+
+        if mask_crops.shape[1] != 1:
+            raise ValueError(
+                f"mask_crops 应为单通道，实际通道数为 {mask_crops.shape[1]}"
+            )
+
+        if encode_batch_size <= 0:
+            raise ValueError(
+                f"encode_batch_size 必须大于 0，实际为 {encode_batch_size}"
+            )
+
+        mask_crops = mask_crops.to(
+            device=device,
+            dtype=dtype,
+        )
+
+        # 避免输入 mask 因格式问题超过 [0,1]
+        mask_crops = mask_crops.clamp(0.0, 1.0)
+
+        mask_latent_chunks = []
+
+        for start in range(0, mask_crops.shape[0], encode_batch_size):
+            end = min(
+                start + encode_batch_size,
+                mask_crops.shape[0],
+            )
+
+            mask_chunk = mask_crops[start:end]
+
+            # [B,1,H,W] -> [B,3,H,W]
+            mask_3ch = mask_chunk.repeat(
+                1,
+                3,
+                1,
+                1,
+            )
+
+            # [0,1] -> [-1,1]
+            mask_3ch = mask_3ch * 2.0 - 1.0
+
+            mask_latents = (
+                self.vae.encode(mask_3ch)
+                .latent_dist.mode()
+            )
+
+            # 与训练保持一致，只乘一次
+            mask_latents = (
+                mask_latents
+                * self.vae.config.scaling_factor
+            )
+
+            mask_latent_chunks.append(mask_latents)
+
+        return torch.cat(
+            mask_latent_chunks,
+            dim=0,
+        )
+
 
     # ================================================================
     # 整图 image -> 整图 latent

@@ -208,20 +208,26 @@ class GlobalLatentProjector(nn.Module):
 
         return self.fuse(x)
 
-
 class ContentAwarePositionGatedConvIn(nn.Module):
     """
     替换 UNet 原始 conv_in。
 
-    输入通道:
-        0:4      noisy_latents              [B, 4, 64, 64]
-        4:8      crop/original latents      [B, 4, 64, 64]
-        8:10     mask embeds               [B, 2, 64, 64]
-        10:16    projected global latents   [B, 6, 64, 64]
-        16:18    center maps               [B, 2, 64, 64]
+    外部送入 UNet 的输入：
+        noisy_latents: [B, 4, 64, 64]
 
-    总输入:
-        18 channels
+    在调用 UNet 前，通过 set_condition_context() 设置：
+        original_crop_latents: [B, 4, 64, 64]
+        mask_embeds:           [B, 4, 64, 64]
+        original_latents_full: [B, 4, H_lat, W_lat]
+        center_maps:           [B, 2, 64, 64]
+
+    conv_in.forward() 内部会：
+        1. 计算全局条件特征；
+        2. 分别投影 noisy、crop、mask、global、center；
+        3. 将各分支结果相加。
+
+    最终输出：
+        [B, unet_conv_in.out_channels, 64, 64]
     """
 
     def __init__(self, unet_conv_in: nn.Conv2d):
@@ -229,6 +235,11 @@ class ContentAwarePositionGatedConvIn(nn.Module):
 
         out_channels = unet_conv_in.out_channels
 
+        # =====================================================
+        # 全局上下文投影器
+        # 该模块必须在 forward 内部被调用，
+        # 才能稳定地参与 DDP 梯度同步。
+        # =====================================================
         self.global_projector = GlobalLatentProjector(
             out_channels=6,
             hidden_channels=64,
@@ -236,19 +247,9 @@ class ContentAwarePositionGatedConvIn(nn.Module):
             context_sizes=(64, 128, 192),
         )
 
-        self.mask_projector = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),   # 512 -> 256
-            nn.SiLU(),
-
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # 256 -> 128
-            nn.SiLU(),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # 128 -> 64
-            nn.SiLU(),
-
-            nn.Conv2d(64, 2, kernel_size=3, stride=1, padding=1),   # [B, 2, 64, 64]
-        )
-
+        # =====================================================
+        # 各输入分支
+        # =====================================================
         self.noise_branch = nn.Conv2d(
             4,
             out_channels,
@@ -274,7 +275,7 @@ class ContentAwarePositionGatedConvIn(nn.Module):
         )
 
         self.mask_branch = nn.Conv2d(
-            2,
+            4,
             out_channels,
             kernel_size=unet_conv_in.kernel_size,
             stride=unet_conv_in.stride,
@@ -305,102 +306,254 @@ class ContentAwarePositionGatedConvIn(nn.Module):
             bias=False,
         )
 
+        # =====================================================
+        # 临时条件上下文
+        #
+        # 它们不是 Parameter，也不注册为 buffer，
+        # 只在当前 forward 前临时设置。
+        # =====================================================
+        self._original_crop_latents = None
+        self._mask_embeds = None
+        self._original_latents_full = None
+        self._center_maps = None
+
         self._init_weights(unet_conv_in)
 
     def _init_weights(self, unet_conv_in: nn.Conv2d):
         """
-        初始化新增 conv_in 分支。
+        初始化新增分支。
 
-        重点:
-            不要把可训练参数手动转 fp16。
-            mixed precision 训练时，参数保持 fp32，
-            前向计算由 accelerator.autocast() 自动处理 fp16。
+        参数保持 fp32；
+        混合精度由 accelerator.autocast() 控制。
         """
 
         with torch.no_grad():
-            # noisy 分支继承原始 conv_in。
+            # noisy 分支继承预训练 Stable Diffusion conv_in。
             self.noise_branch.weight.copy_(unet_conv_in.weight)
 
             if unet_conv_in.bias is not None:
                 self.noise_branch.bias.copy_(unet_conv_in.bias)
 
-            # crop 分支也是 4 通道 latent，可以复制原始 conv_in。
+            # crop latent 同样是4通道 latent，
+            # 以较小权重复制原始 conv_in。
             self.crop_branch.weight.copy_(unet_conv_in.weight)
             self.crop_branch.weight.mul_(0.1)
 
-            # mask/global 是新条件，输入通道和原始 conv_in 不一致，不能 copy。
-            # 这里建议初始化为 0，让它们从无影响开始学习。
+            # 新增条件分支从弱影响开始。
             self.mask_branch.weight.zero_()
+
             nn.init.normal_(
                 self.global_branch.weight,
                 mean=0.0,
                 std=1e-3,
             )
-            # center 位置条件也从 0 开始学习。
+
             self.center_branch.weight.zero_()
 
-    def project_global_latents(
+    def set_condition_context(
         self,
         original_crop_latents: torch.Tensor,
+        mask_embeds: torch.Tensor,
         original_latents_full: torch.Tensor,
         center_maps: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> None:
         """
-        生成全局上下文条件特征。
+        在调用完整 UNet 前设置当前 batch 的条件。
 
-        注意:
-            这里不要写 self.global_projector.to(dtype=...)
-            否则会把可训练参数真的变成 fp16，
-            导致 accelerate 报:
-                Attempting to unscale FP16 gradients.
+        注意：
+            这里只保存 Tensor 引用，不执行含可训练参数的运算。
+            global_projector 的运算会在 forward() 中执行。
         """
 
-        return self.global_projector(
+        if original_crop_latents.ndim != 4:
+            raise ValueError(
+                "original_crop_latents must be a 4D tensor, "
+                f"got shape {original_crop_latents.shape}."
+            )
+
+        if mask_embeds.ndim != 4:
+            raise ValueError(
+                "mask_embeds must be a 4D tensor, "
+                f"got shape {mask_embeds.shape}."
+            )
+
+        if original_latents_full.ndim != 4:
+            raise ValueError(
+                "original_latents_full must be a 4D tensor, "
+                f"got shape {original_latents_full.shape}."
+            )
+
+        if center_maps.ndim != 4:
+            raise ValueError(
+                "center_maps must be a 4D tensor, "
+                f"got shape {center_maps.shape}."
+            )
+
+        batch_size = original_crop_latents.shape[0]
+
+        if mask_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "mask_embeds batch size does not match "
+                "original_crop_latents."
+            )
+
+        if original_latents_full.shape[0] != batch_size:
+            raise ValueError(
+                "original_latents_full batch size does not match "
+                "original_crop_latents."
+            )
+
+        if center_maps.shape[0] != batch_size:
+            raise ValueError(
+                "center_maps batch size does not match "
+                "original_crop_latents."
+            )
+
+        if original_crop_latents.shape[1] != 4:
+            raise ValueError(
+                "original_crop_latents must have 4 channels, "
+                f"got {original_crop_latents.shape[1]}."
+            )
+
+        if mask_embeds.shape[1] != 4:
+            raise ValueError(
+                "mask_embeds must have 4 channels, "
+                f"got {mask_embeds.shape[1]}."
+            )
+
+        if original_latents_full.shape[1] != 4:
+            raise ValueError(
+                "original_latents_full must have 4 channels, "
+                f"got {original_latents_full.shape[1]}."
+            )
+
+        if center_maps.shape[1] != 2:
+            raise ValueError(
+                "center_maps must have 2 channels, "
+                f"got {center_maps.shape[1]}."
+            )
+
+        self._original_crop_latents = original_crop_latents
+        self._mask_embeds = mask_embeds
+        self._original_latents_full = original_latents_full
+        self._center_maps = center_maps
+
+    def clear_condition_context(self) -> None:
+        """
+        清除当前 batch 的条件引用，避免长期持有计算图或大 Tensor。
+        """
+
+        self._original_crop_latents = None
+        self._mask_embeds = None
+        self._original_latents_full = None
+        self._center_maps = None
+
+    def _check_condition_context(self, noisy_latents: torch.Tensor) -> None:
+        """
+        检查调用 forward 前是否已经设置条件。
+        """
+
+        missing = []
+
+        if self._original_crop_latents is None:
+            missing.append("original_crop_latents")
+
+        if self._mask_embeds is None:
+            missing.append("mask_embeds")
+
+        if self._original_latents_full is None:
+            missing.append("original_latents_full")
+
+        if self._center_maps is None:
+            missing.append("center_maps")
+
+        if missing:
+            raise RuntimeError(
+                "Condition context has not been set. "
+                "Call conv_in.set_condition_context(...) before UNet forward. "
+                f"Missing: {', '.join(missing)}."
+            )
+
+        batch_size = noisy_latents.shape[0]
+
+        if self._original_crop_latents.shape[0] != batch_size:
+            raise ValueError(
+                "The condition batch size does not match noisy_latents: "
+                f"{self._original_crop_latents.shape[0]} vs {batch_size}."
+            )
+
+    def forward(self, noisy_latents: torch.Tensor) -> torch.Tensor:
+        """
+        参数：
+            noisy_latents: [B, 4, 64, 64]
+
+        返回：
+            [B, out_channels, 64, 64]
+        """
+
+        if noisy_latents.ndim != 4:
+            raise ValueError(
+                "noisy_latents must be a 4D tensor, "
+                f"got shape {noisy_latents.shape}."
+            )
+
+        if noisy_latents.shape[1] != 4:
+            raise ValueError(
+                "ContentAwarePositionGatedConvIn expects "
+                "4-channel noisy latents as the direct UNet input, "
+                f"got {noisy_latents.shape[1]} channels."
+            )
+
+        self._check_condition_context(noisy_latents)
+
+        original_crop_latents = self._original_crop_latents
+        mask_embeds = self._mask_embeds
+        original_latents_full = self._original_latents_full
+        center_maps = self._center_maps
+
+        # 尺寸统一。
+        target_size = noisy_latents.shape[-2:]
+
+        if original_crop_latents.shape[-2:] != target_size:
+            original_crop_latents = F.interpolate(
+                original_crop_latents,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if mask_embeds.shape[-2:] != target_size:
+            mask_embeds = F.interpolate(
+                mask_embeds,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if center_maps.shape[-2:] != target_size:
+            center_maps = F.interpolate(
+                center_maps,
+                size=target_size,
+                mode="nearest",
+            )
+
+        # =====================================================
+        # 关键：
+        # global_projector 在完整 UNet forward 内部执行。
+        # DDP 可以正常追踪这些参数。
+        # =====================================================
+        projected_global_latents = self.global_projector(
             original_crop_latents=original_crop_latents,
             original_latents_full=original_latents_full,
             center_maps=center_maps,
         )
 
-    def project_mask_crop(self, mask_crop: torch.Tensor) -> torch.Tensor:
-        """
-        将单通道 mask crop 编码成 2 通道条件。
-
-        输入:
-            mask_crop: [B, 1, 512, 512]
-
-        输出:
-            mask_embeds: [B, 2, 64, 64]
-
-        注意:
-            这里也不要手动把 mask_projector 转 fp16。
-            让 accelerator.autocast() 负责前向精度。
-        """
-
-        return self.mask_projector(mask_crop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, 18, 64, 64]
-        """
-
-        if x.shape[1] != 18:
-            raise ValueError(
-                f"ContentAwarePositionGatedConvIn expects 18 input channels, "
-                f"got {x.shape[1]}."
-            )
-
-        noisy_latents = x[:, 0:4]
-        crop_latents = x[:, 4:8]
-        mask_embeds = x[:, 8:10]
-        global_latents = x[:, 10:16]
-        center_maps = x[:, 16:18]
-
         noise_feat = self.noise_branch(noisy_latents)
 
         condition_feat = (
-            self.crop_branch(crop_latents)
+            self.crop_branch(original_crop_latents)
             + self.mask_branch(mask_embeds)
-            + self.global_branch(global_latents)
+            + self.global_branch(projected_global_latents)
             + self.center_branch(center_maps)
         )
 
@@ -409,10 +562,16 @@ class ContentAwarePositionGatedConvIn(nn.Module):
     @classmethod
     def apply_to_unet(cls, unet):
         """
-        替换 UNet 的 conv_in，并更新配置输入通道数。
+        替换 UNet 原始 conv_in。
+
+        注意：
+            修改后，UNet 的直接输入仍然是4通道 noisy_latents。
+            其他条件通过 set_condition_context() 传入。
         """
 
         unet.conv_in = cls(unet.conv_in)
-        unet.register_to_config(in_channels=18)
+
+        # 外部调用 unet 时只传4通道 noisy_latents。
+        unet.register_to_config(in_channels=4)
 
         return unet
