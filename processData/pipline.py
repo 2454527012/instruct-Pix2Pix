@@ -12,7 +12,8 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix
     retrieve_latents,
 )
 from diffusers.utils.torch_utils import randn_tensor
-
+import cv2
+import numpy as np
 
 class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
     """
@@ -42,6 +43,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         prompt: str | list[str] = None,
         image: PipelineImageInput = None,
         mask: PipelineImageInput = None,
+        inpaint_mask: PipelineImageInput = None,
         crop_size: int = 512,
         crop_overlap: int = 128,
         num_inference_steps: int = 50,
@@ -158,6 +160,55 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             mask=mask,
             height=pixel_h,
             width=pixel_w,
+            device=device,
+            dtype=dtype,
+        )
+
+        inpaint_mask_tensor=self.preprocess_mask_to_tensor(
+            mask=inpaint_mask,
+            height=pixel_h,
+            width=pixel_w,
+            device=device,
+            dtype=dtype,
+        )
+        binary_mask = (
+            inpaint_mask_tensor >= 0.5
+        ).float()
+
+        mask_np = (
+            binary_mask[0, 0]
+            .cpu()
+            .numpy()
+            .astype(np.uint8)
+        )
+
+        # 距离到白色区域
+        dist = cv2.distanceTransform(
+            1 - mask_np,
+            cv2.DIST_L2,
+            5,
+        )
+
+        # 过渡宽度（像素）
+        transition_width = 128
+
+        weight = np.clip(
+            1.0 - dist / transition_width,
+            0.0,
+            1.0,
+        )
+
+        # 保证白色区域仍然是1
+        weight[mask_np == 1] = 1.0
+
+        weight = torch.from_numpy(weight)[None, None]
+
+        inpaint_mask_latent = F.interpolate(
+            weight,
+            size=(latent_h, latent_w),
+            mode="bilinear",
+            align_corners=False,
+        ).to(
             device=device,
             dtype=dtype,
         )
@@ -319,7 +370,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         #
         # 每一步 denoise 时临时从 global_latents 切 crop。
         # ------------------------------------------------------------
-        global_latents = self.prepare_global_latents(
+        global_latents , global_noise= self.prepare_global_latents(
             latent_h=latent_h,
             latent_w=latent_w,
             num_channels_latents=self.vae.config.latent_channels,
@@ -533,6 +584,50 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     latent_w=latent_w,
                     latent_crop_size=latent_crop_size,
                 )
+
+
+                    # ------------------------------------------------------------
+                    # 用输入图在下一时间步的加噪 latent 覆盖非修复区域
+                    #
+                    # scheduler.step 后：
+                    #     global_latents 已经从 x_t 更新到下一状态
+                    #
+                    # 因此输入图也应加噪到下一个 timestep，而不是当前 t。
+                    #
+                    # 白色区域 mask=1：
+                    #     保留生成 latent
+                    #
+                    # 黑色区域 mask=0：
+                    #     使用输入图对应噪声级别的 latent
+                    # ------------------------------------------------------------
+                if inpaint_mask is not None:
+                    if step_index < len(timesteps) - 1:
+                        next_t = timesteps[step_index + 1]
+                        # add_noise 要求 timestep 至少是一维，
+                        # 对当前单张整图构造 [1]。
+                        if torch.is_tensor(next_t):
+                            next_t_batch = next_t.reshape(1).to(
+                                device=original_latents_full.device
+                            )
+                        else:
+                            next_t_batch = torch.tensor(
+                                [next_t],
+                                device=original_latents_full.device,
+                                dtype=torch.long,
+                            )
+                        input_latents_noisy = self.scheduler.add_noise(
+                            original_samples=original_latents_full,
+                            noise=global_noise,
+                            timesteps=next_t_batch,
+                        )
+                    else:
+                        # 最后一步去噪完成后，非修复区域直接恢复干净输入 latent。
+                        input_latents_noisy = original_latents_full
+                    global_latents = (
+                        inpaint_mask_latent * global_latents
+                        + (1.0 - inpaint_mask_latent) * input_latents_noisy
+                    )
+
 
                 # callback
                 if callback_on_step_end is not None:
@@ -868,16 +963,16 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             latent_w,
         )
 
-        latents = randn_tensor(
+        noisy = randn_tensor(
             shape,
             generator=generator,
             device=device,
             dtype=dtype,
         )
 
-        latents = latents * self.scheduler.init_noise_sigma
+        latents = noisy * self.scheduler.init_noise_sigma
 
-        return latents
+        return latents, noisy
 
     # ================================================================
     # 从整图 latent 上切 crop

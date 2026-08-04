@@ -1716,7 +1716,7 @@ def main():
                     )
                 )
 
-                repair_weight_alpha = 4.0
+                repair_weight_alpha = 8.0
 
                 loss_weights = (
                     1.0
@@ -1730,16 +1730,46 @@ def main():
                     reduction="none",
                 )
 
-                if random.random() < 0.7:
-                    loss = (
-                        loss_map
-                        * loss_weights
-                    ).sum() / (
-                        loss_weights.sum()
-                        .clamp_min(1e-8)
-                    )
-                else:
-                    loss = loss_map.mean()
+                weighted_loss = (
+                    (loss_map * loss_weights)
+                    .sum(dim=(1, 2, 3))
+                    /
+                    loss_weights
+                    .sum(dim=(1, 2, 3))
+                    .clamp_min(1e-8)
+                )
+
+                normal_loss = loss_map.mean(
+                    dim=(1, 2, 3)
+                )
+
+                bsz = model_pred.shape[0]
+
+                use_weight = torch.ones(
+                    bsz,
+                    device=model_pred.device,
+                    dtype=torch.bool,
+                )
+
+                num_unweighted = max(
+                    1,
+                    bsz // 4,
+                )
+
+                unweighted_indices = torch.randperm(
+                    bsz,
+                    device=model_pred.device,
+                )[:num_unweighted]
+
+                use_weight[
+                    unweighted_indices
+                ] = False
+
+                loss = torch.where(
+                    use_weight,
+                    weighted_loss,
+                    normal_loss,
+                ).mean()
 
                 avg_loss = accelerator.gather(
                     loss.detach().reshape(1)

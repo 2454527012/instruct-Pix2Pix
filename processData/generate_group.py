@@ -90,7 +90,7 @@ VAL_TXT = (
 
 OUTPUT_DIR = (
     PROJECT_ROOT
-    / "results_global_latent_test_70000"
+    / "results_global_latent_test_inpaint_100000"
 )
 
 
@@ -136,15 +136,12 @@ SKIP_EXISTING = True
 # ============================================================
 
 def clear_memory():
-
     gc.collect()
-
     torch.cuda.empty_cache()
 
 
 
 def find_file(folder, name):
-
     for ext in [
         ".jpg",
         ".jpeg",
@@ -152,7 +149,6 @@ def find_file(folder, name):
         ".JPG",
         ".PNG"
     ]:
-
         path = (
             folder
             /
@@ -234,29 +230,21 @@ def load_pipeline():
     pipe.text_encoder.eval()
     return pipe
 
-
-
-
 # ============================================================
 # prepare input
 # ============================================================
-
-
 def prepare_input(
     image_file,
     xml_file,
     mask_file
 ):
-
-
     original = (
         PIL.Image
         .open(image_file)
         .convert("RGB")
     )
 
-
-    edited,_ = (
+    edited, inpaint_mask = (
         fill_box_with_mean_color(
             str(xml_file),
             str(image_file),
@@ -264,18 +252,15 @@ def prepare_input(
         )
     )
 
-
     edited = edited.convert(
         "RGB"
     )
-
 
     mask = (
         PIL.Image
         .open(mask_file)
         .convert("L")
     )
-
 
     original = crop_to_8(
         original
@@ -289,14 +274,12 @@ def prepare_input(
         mask
     )
 
-
     return (
         original,
         edited,
-        mask
+        mask,
+        inpaint_mask
     )
-
-
 
 
 # ============================================================
@@ -314,16 +297,13 @@ def inference_one(
     index
 ):
 
-
     save_dir = OUTPUT_DIR
-
 
     output_file = (
         save_dir
         /
         f"{name}_generate.png"
     )
-
 
     if (
         SKIP_EXISTING
@@ -332,14 +312,11 @@ def inference_one(
         print(f'{name} has existed. skip')
         return
 
-
-
-    original,edited,mask = prepare_input(
+    original,edited,mask,inpaint_mask = prepare_input(
         image_file,
         xml_file,
         mask_file
     )
-
 
     generator = (
         torch.Generator(
@@ -350,8 +327,6 @@ def inference_one(
         )
     )
 
-
-
     result = pipe(
 
         prompt=PROMPT,
@@ -359,6 +334,8 @@ def inference_one(
         image=edited,
 
         mask=mask,
+        
+        inpaint_mask=inpaint_mask,
 
         crop_size=CROP_SIZE,
 
@@ -380,19 +357,15 @@ def inference_one(
 
     ).images[0]
 
-
-
     original.save(
         save_dir /
         f"{name}_original.png"
     )
 
-
     edited.save(
         save_dir /
         f"{name}_input.png"
     )
-
 
     mask.save(
         save_dir /
@@ -403,7 +376,6 @@ def inference_one(
     result.save(
         output_file
     )
-
 
     print(
         "done:",
@@ -417,81 +389,52 @@ def inference_one(
 # ============================================================
 # main
 # ============================================================
-
-
 def main():
-
-
     OUTPUT_DIR.mkdir(
         exist_ok=True,
         parents=True
     )
-
-
     with open(
         VAL_TXT,
         "r"
     ) as f:
-
         names=[
             x.strip()
             for x in f
             if x.strip()
         ]
 
-
-
     if MAX_IMAGES:
-
         names = names[:MAX_IMAGES]
-
-
 
     pipe = load_pipeline()
 
-
-
     for idx,name in enumerate(names):
-
-
         try:
-
-
             image_file = find_file(
                 IMAGE_DIR,
                 name
             )
-
-
             xml_file = (
                 XML_DIR
                 /
                 f"{name}.xml"
             )
-
-
             mask_file = find_file(
                 MASK_DIR,
                 name
             )
-
-
-
             if (
                 image_file is None
                 or not xml_file.exists()
                 or mask_file is None
             ):
-
                 print(
                     "missing:",
                     name
                 )
-
                 continue
-
-
-
+            
             inference_one(
                 pipe,
                 name,
@@ -501,20 +444,14 @@ def main():
                 idx
             )
 
-
-
         except Exception as e:
-
             print(
                 "failed:",
                 name,
                 e
             )
 
-
-
         if idx % 10 == 0:
-
             clear_memory()
 
 
