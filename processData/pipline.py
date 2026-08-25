@@ -30,10 +30,10 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         1. 整张图先 VAE encode 成整图 latent
         2. 初始化一张整图 noisy latent
         3. 每一步 denoising 时，从整图 noisy latent 上切 latent crop
-        4. 每个 latent crop 单独 UNet 预测
-        5. scheduler.step 得到 next crop latent
-        6. 把所有 next crop latent 写回整图 latent
-        7. 重叠 latent 区域平均
+        4. 每个 latent crop 单独 UNet 预测噪声
+        5. 把所有 crop 噪声预测写回整图噪声图
+        6. 重叠 latent 区域平均
+        7. 对整图 latent 执行一次 scheduler.step
         8. 最后只对整图 latent 做一次 VAE decode
     """
 
@@ -411,8 +411,10 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         #       ↓ 切 latent crop
         #   crop_latents
         #       ↓ UNet 预测 noise
-        #   next_crop_latents
-        #       ↓ 写回整图 latent，重叠区域平均
+        #   crop_noise_pred
+        #       ↓ 融合为整图 noise，重叠区域平均
+        #   global_noise_pred
+        #       ↓ scheduler.step
         #   global_latents
         #
         # 所以最后 global_latents 本身就是完整大图 latent。
@@ -545,45 +547,33 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     )
 
                 # ----------------------------------------------------
-                # 16.5 对每个 crop 做 scheduler.step
+                # 16.5 先融合所有 crop 的噪声预测
                 #
-                # 输入：
-                #   crop_noise_pred: [N, 4, 64, 64]
-                #   crop_latents:    [N, 4, 64, 64]
-                #
-                # 输出：
-                #   next_crop_latents: [N, 4, 64, 64]
+                # 对重叠位置做逐通道简单平均，得到与整图 latent
+                # 尺寸相同的噪声预测：
+                #   global_noise_pred: [1, 4, H_lat, W_lat]
                 # ----------------------------------------------------
-                next_crop_latents = self.scheduler.step(
-                    crop_noise_pred,
-                    t,
-                    crop_latents,
-                    **extra_step_kwargs,
-                    return_dict=False,
-                )[0]
-
-                # ----------------------------------------------------
-                # 16.6 把 next crop latent 拼回整图 latent
-                #
-                # 这是新版最关键的第三处变化：
-                #
-                # 旧版：
-                #   crop_latents = next_crop_latents
-                #   最后 decode 每个 crop
-                #
-                # 新版：
-                #   global_latents = stitch_crop_latents_to_global(...)
-                #   下一步再从 global_latents 切 crop
-                #
-                # 重叠区域直接平均。
-                # ----------------------------------------------------
-                global_latents = self.stitch_crop_latents_to_global(
-                    crop_latents=next_crop_latents,
+                global_noise_pred = self.fuse_crop_tensors_to_global(
+                    crop_tensors=crop_noise_pred,
                     windows=windows,
                     latent_h=latent_h,
                     latent_w=latent_w,
                     latent_crop_size=latent_crop_size,
                 )
+
+                # ----------------------------------------------------
+                # 16.6 对整张图只执行一次 scheduler.step
+                #
+                # 此时 model_output 与 sample 都是整图 latent，因此
+                # scheduler 的状态和随机项也只在整图尺度更新一次。
+                # ----------------------------------------------------
+                global_latents = self.scheduler.step(
+                    global_noise_pred,
+                    t,
+                    global_latents,
+                    **extra_step_kwargs,
+                    return_dict=False,
+                )[0]
 
 
                     # ------------------------------------------------------------
@@ -1047,31 +1037,31 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         return torch.cat(crops, dim=0)
 
     # ================================================================
-    # crop latent 拼回整图 latent
+    # crop tensor 融合到整图 tensor
     # ================================================================
-    def stitch_crop_latents_to_global(
+    def fuse_crop_tensors_to_global(
         self,
-        crop_latents: torch.Tensor,
+        crop_tensors: torch.Tensor,
         windows: list[dict],
         latent_h: int,
         latent_w: int,
         latent_crop_size: int,
     ):
         """
-        把每个 crop latent 写回整图 latent。
+        把每个 crop tensor 写回整图 tensor。
 
         重叠区域平均。
 
-        crop_latents:
-            [N, 4, latent_crop_size, latent_crop_size]
+        crop_tensors:
+            [N, C, latent_crop_size, latent_crop_size]
 
         return:
-            [1, 4, latent_h, latent_w]
+            [1, C, latent_h, latent_w]
         """
 
-        num_crops, channels, _, _ = crop_latents.shape
-        device = crop_latents.device
-        dtype = crop_latents.dtype
+        num_crops, channels, _, _ = crop_tensors.shape
+        device = crop_tensors.device
+        dtype = crop_tensors.dtype
 
         global_sum = torch.zeros(
             1,
@@ -1100,7 +1090,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 :,
                 latent_top : latent_top + latent_crop_size,
                 latent_left : latent_left + latent_crop_size,
-            ] += crop_latents[idx : idx + 1]
+            ] += crop_tensors[idx : idx + 1]
 
             global_count[
                 :,
@@ -1109,9 +1099,9 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 latent_left : latent_left + latent_crop_size,
             ] += 1.0
 
-        global_latents = global_sum / global_count.clamp(min=1e-6)
+        global_tensor = global_sum / global_count.clamp(min=1e-6)
 
-        return global_latents
+        return global_tensor
 
     # ================================================================
     # 生成 CFG 条件
