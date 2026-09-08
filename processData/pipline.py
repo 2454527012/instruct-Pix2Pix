@@ -63,7 +63,12 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         confidence_context_radius: int = 128,
         confidence_agreement_strength: float = 1.0,
         confidence_temporal_strength: float = 0.5,
+        confidence_propagation_gamma: float = 3.0,
+        global_context_strength: float = 0.85,
         window_jitter_ratio: float = 0.4,
+        mask_aware_window_routing: bool = False,
+        mask_aware_min_known_fraction: float = 0.05,
+        mask_aware_jitter_attempts: int = 16,
         window_seed: int | None = None,
         **kwargs,
     ):
@@ -100,8 +105,20 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         if confidence_temporal_strength < 0.0:
             raise ValueError("confidence_temporal_strength 不能小于 0。")
 
+        if confidence_propagation_gamma <= 0.0:
+            raise ValueError("confidence_propagation_gamma 必须大于 0。")
+
+        if not 0.0 <= global_context_strength <= 1.0:
+            raise ValueError("global_context_strength 必须在 [0, 1] 内。")
+
         if not 0.0 <= window_jitter_ratio <= 0.5:
             raise ValueError("window_jitter_ratio 必须在 [0, 0.5] 内。")
+
+        if not 0.0 <= mask_aware_min_known_fraction <= 1.0:
+            raise ValueError("mask_aware_min_known_fraction 必须在 [0, 1] 内。")
+
+        if mask_aware_jitter_attempts < 1:
+            raise ValueError("mask_aware_jitter_attempts 必须大于等于 1。")
 
         self._guidance_scale = guidance_scale
         self._image_guidance_scale = image_guidance_scale
@@ -255,7 +272,35 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         )
         windows = self.make_pixel_windows(base_tops, base_lefts)
 
-        num_crops = len(windows)
+        # mask-aware routing 不改变全图 latent 的状态表示；它只减少 UNet
+        # 实际处理的窗口。每个保留窗口都与修复区域相交，边界窗口还必须
+        # 看到一定比例的已知像素。大区域的深中心窗口会作为桥接窗口保留，
+        # 因此不会因为缺少已知像素而出现未覆盖的修复位置。
+        mask_aware_base_windows = None
+        if mask_aware_window_routing:
+            mask_aware_base_windows = self.build_mask_aware_base_windows(
+                repair_mask=mask_np,
+                base_tops=base_tops,
+                base_lefts=base_lefts,
+                crop_size=crop_size,
+                min_known_fraction=mask_aware_min_known_fraction,
+            )
+            if len(mask_aware_base_windows) == 0:
+                print(
+                    "Warning: mask-aware routing found no repair pixels; "
+                    "falling back to regular windows.",
+                    flush=True,
+                )
+                mask_aware_base_windows = None
+            else:
+                print(
+                    "mask-aware routing: "
+                    f"{len(mask_aware_base_windows)}/{len(windows)} "
+                    "base windows intersect the repair mask.",
+                    flush=True,
+                )
+
+        mask_aware_routing_enabled = mask_aware_base_windows is not None
         window_jitter_pixels = (
             int(
                 crop_overlap
@@ -270,34 +315,47 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         )
 
         # ------------------------------------------------------------
-        # 5.1 预计算 crop 融合可信度的静态部分
+        # 5.1 预计算融合可信度的整图静态部分
         #
-        # edge_weight：crop 中心高、边缘低，反映边界感受野不完整；
-        # repair_mask/distance：整图坐标系下的静态图。context_support 与
+        # 不再使用“crop 中心高、边缘低”的位置先验。每个 crop 的基础
+        # 可信度只由它在当前窗口内真正看见的非修复区域决定。
+        # repair_mask/distance 是整图坐标系下的静态图；context_support 与
         # overlap coverage 会在每个 timestep 依据当前随机窗口重新计算。
         # ------------------------------------------------------------
         (
-            crop_edge_weights,
-            _,
             repair_mask_latent,
             repair_distance_latent,
-        ) = self.prepare_crop_confidence_maps(
+        ) = self.prepare_global_confidence_maps(
             inpaint_mask=inpaint_mask_tensor,
-            windows=windows,
             latent_h=latent_h,
             latent_w=latent_w,
-            latent_crop_size=latent_crop_size,
-            context_radius_pixels=confidence_context_radius,
-            min_weight=confidence_min_weight,
         )
-
-        coverage_crops = torch.ones(
-            num_crops,
-            1,
-            latent_crop_size,
-            latent_crop_size,
-            device=device,
-            dtype=dtype,
+        # 对 mask-aware 路径，任何被至少一个修复像素覆盖的 latent 单元
+        # 都允许更新；其余单元在每一步都回写为输入图的带噪 latent。
+        # ``area > 0`` 保留像素 mask 到 latent 网格的边界覆盖，避免细小
+        # 修复区域在下采样时消失。
+        if mask_aware_routing_enabled:
+            routing_update_mask_latent = (
+                F.interpolate(
+                    binary_mask,
+                    size=(latent_h, latent_w),
+                    mode="area",
+                )
+                > 0.0
+            ).to(dtype=dtype)
+        else:
+            routing_update_mask_latent = torch.ones(
+                1,
+                1,
+                latent_h,
+                latent_w,
+                device=device,
+                dtype=dtype,
+            )
+        state_inpaint_mask_latent = (
+            routing_update_mask_latent
+            if mask_aware_routing_enabled
+            else inpaint_mask_latent
         )
         # ------------------------------------------------------------
         # 6. 整图 VAE encode
@@ -330,39 +388,65 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             encode_batch_size=crop_process_batch_size,
         )
 
-        original_latents_full_per_crop = original_latents_full.expand(
-            num_crops,
-            -1,
-            -1,
-            -1,
-        )
-
         # ------------------------------------------------------------
-        # 8. 固定的整图条件做 CFG 扩展
+        # 7.1 全图低分辨率结构分支的条件
         #
-        # original_latents_full 对所有 crop 相同，因此可以在循环外预先复制。
-        # image/mask/center 三个与窗口坐标有关的条件会在每个 timestep 中
-        # 重新从整图 latent 切出并做 CFG 扩展。
+        # 整图 image/mask 已经完成 VAE encode；这里仅在 latent 空间映射到
+        # 一个与训练 crop 相同的方形网格。这样全图分支能在同一个
+        # UNet 感受野里看到 mask 四周的真实道路、草地和边线，不会再次
+        # VAE encode。
         # ------------------------------------------------------------
+        (
+            coarse_latent_h,
+            coarse_latent_w,
+        ) = self.get_global_context_latent_size(
+            latent_h=latent_h,
+            latent_w=latent_w,
+            max_latent_side=latent_crop_size,
+        )
+        coarse_original_image_latents = F.interpolate(
+            original_latents_full,
+            size=(coarse_latent_h, coarse_latent_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        coarse_image_latents = coarse_original_image_latents
+        coarse_mask_latents = F.interpolate(
+            mask_latents_full,
+            size=(coarse_latent_h, coarse_latent_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        coarse_center_maps = torch.full(
+            (1, 2, coarse_latent_h, coarse_latent_w),
+            0.5,
+            device=device,
+            dtype=dtype,
+        )
+        coarse_original_latents_full = original_latents_full
+        coarse_prompt_embeds = prompt_embeds
+
         if self.do_classifier_free_guidance:
-            original_latents_full_per_crop = self.make_cfg_condition(
-                original_latents_full_per_crop
+            coarse_image_latents = self.make_cfg_condition(
+                coarse_image_latents
+            )
+            coarse_mask_latents = self.make_cfg_condition(
+                coarse_mask_latents
+            )
+            coarse_center_maps = self.make_cfg_condition(
+                coarse_center_maps
+            )
+            coarse_original_latents_full = self.make_cfg_condition(
+                coarse_original_latents_full
             )
 
         # ------------------------------------------------------------
-        # 9. prompt embeds 复制到每个 crop
+        # 8. 保存固定的整图/文本条件
         #
-        # 原始：
-        #   CFG: [3, seq, dim]
-        #
-        # 变成：
-        #   CFG: [3N, seq, dim]
+        # mask-aware routing 在不同 timestep 可能因覆盖补偿而拥有不同数量
+        # 的 crop；因此整图 latent 与 prompt 的按-crop 扩展必须放到循环内。
         # ------------------------------------------------------------
-        prompt_embeds = self.repeat_cfg_tensor_for_crops(
-            tensor=prompt_embeds,
-            num_crops=num_crops,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-        )
+        base_prompt_embeds = prompt_embeds
 
         # ------------------------------------------------------------
         # 13. 初始化整图 noisy latent
@@ -407,7 +491,48 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         self._num_timesteps = len(timesteps)
 
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        # 全图低分辨率分支必须使用独立 scheduler 状态。某些 scheduler
+        # 会在 step() 内保存历史项；若与局部分支共用，会破坏两条轨迹。
+        global_context_enabled = global_context_strength > 0.0
+        if global_context_enabled:
+            coarse_scheduler = self.scheduler.__class__.from_config(
+                self.scheduler.config
+            )
+            coarse_scheduler.set_timesteps(
+                num_inference_steps,
+                device=device,
+            )
+            coarse_generator = self.create_window_generator(
+                generator=generator,
+                window_seed=window_seed,
+                seed_offset=1,
+            )
+            coarse_extra_step_kwargs = self.prepare_extra_step_kwargs(
+                coarse_generator,
+                eta,
+            )
+            coarse_noise = F.interpolate(
+                global_noise,
+                size=(coarse_latent_h, coarse_latent_w),
+                mode="area",
+            )
+            coarse_noise = self.normalize_noise_to_unit_variance(
+                coarse_noise
+            )
+            coarse_latents = (
+                coarse_noise * coarse_scheduler.init_noise_sigma
+            )
+            coarse_inpaint_mask_latent = F.interpolate(
+                inpaint_mask_latent,
+                size=(coarse_latent_h, coarse_latent_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        num_warmup_steps = (
+            len(timesteps) - num_inference_steps * self.scheduler.order
+        )
         previous_global_pred_original_sample = None
 
         # ------------------------------------------------------------
@@ -430,22 +555,108 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for step_index, t in enumerate(timesteps):
                 # ----------------------------------------------------
-                # 16.1 为当前 timestep 采样新的受限随机窗口
+                # 16.1 全图低分辨率结构预测
                 #
-                # x/y 的内部窗口使用独立随机相位偏移；图像边界处的窗口
-                # 固定不动，因此每一步仍完整覆盖整图。
+                # 该分支在一个 512 级别的完整视野中预测噪声，因此对
+                # 1024 级大 mask 的中心也能同时看到四周真实结构。
                 # ----------------------------------------------------
-                windows = self.sample_jittered_pixel_windows(
-                    base_tops=base_tops,
-                    base_lefts=base_lefts,
-                    crop_size=crop_size,
-                    minimum_overlap=minimum_random_overlap,
-                    jitter_pixels=window_jitter_pixels,
-                    generator=window_generator,
+                if global_context_enabled:
+                    if self.do_classifier_free_guidance:
+                        coarse_model_input = torch.cat(
+                            [
+                                coarse_latents,
+                                coarse_latents,
+                                coarse_latents,
+                            ],
+                            dim=0,
+                        )
+                    else:
+                        coarse_model_input = coarse_latents
+
+                    coarse_model_input = coarse_scheduler.scale_model_input(
+                        coarse_model_input,
+                        t,
+                    )
+                    coarse_noise_pred = self.run_conditioned_unet_in_batches(
+                        latent_model_input=coarse_model_input,
+                        timestep=t,
+                        image_condition=coarse_image_latents,
+                        mask_condition=coarse_mask_latents,
+                        full_image_condition=coarse_original_latents_full,
+                        center_condition=coarse_center_maps,
+                        prompt_embeds=coarse_prompt_embeds,
+                        process_batch_size=crop_process_batch_size,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                    )
+
+                    if self.do_classifier_free_guidance:
+                        (
+                            coarse_noise_pred_text,
+                            coarse_noise_pred_image,
+                            coarse_noise_pred_uncond,
+                        ) = coarse_noise_pred.chunk(3)
+                        coarse_noise_pred = (
+                            coarse_noise_pred_uncond
+                            + self.guidance_scale
+                            * (
+                                coarse_noise_pred_text
+                                - coarse_noise_pred_image
+                            )
+                            + self.image_guidance_scale
+                            * (
+                                coarse_noise_pred_image
+                                - coarse_noise_pred_uncond
+                            )
+                        )
+
+                # ----------------------------------------------------
+                # 16.2 为当前 timestep 采样新的受限随机窗口
+                #
+                # 常规路径仍使用整图网格。mask-aware 路径仅随机采样与
+                # repair mask 相交的窗口，并保持边界窗口对已知区域的覆盖；
+                # 抖动后若出现修复像素漏覆盖，会回退补入对应基础窗口。
+                # ----------------------------------------------------
+                if mask_aware_routing_enabled:
+                    windows = self.sample_mask_aware_pixel_windows(
+                        base_windows=mask_aware_base_windows,
+                        repair_mask=mask_np,
+                        image_h=pixel_h,
+                        image_w=pixel_w,
+                        crop_size=crop_size,
+                        jitter_pixels=window_jitter_pixels,
+                        min_known_fraction=mask_aware_min_known_fraction,
+                        max_attempts=mask_aware_jitter_attempts,
+                        generator=window_generator,
+                    )
+                else:
+                    windows = self.sample_jittered_pixel_windows(
+                        base_tops=base_tops,
+                        base_lefts=base_lefts,
+                        crop_size=crop_size,
+                        minimum_overlap=minimum_random_overlap,
+                        jitter_pixels=window_jitter_pixels,
+                        generator=window_generator,
+                    )
+
+                num_crops = len(windows)
+                original_latents_full_per_crop = original_latents_full.expand(
+                    num_crops,
+                    -1,
+                    -1,
+                    -1,
+                )
+                if self.do_classifier_free_guidance:
+                    original_latents_full_per_crop = self.make_cfg_condition(
+                        original_latents_full_per_crop
+                    )
+                crop_prompt_embeds = self.repeat_cfg_tensor_for_crops(
+                    tensor=base_prompt_embeds,
+                    num_crops=num_crops,
+                    do_classifier_free_guidance=self.do_classifier_free_guidance,
                 )
 
                 # ----------------------------------------------------
-                # 16.2 从整图 latent 切出当前窗口的所有条件
+                # 16.3 从整图 latent 切出当前窗口的所有条件
                 #
                 # crop_latents:
                 #   [N, 4, 64, 64]
@@ -514,9 +725,6 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     t,
                 )
 
-                noise_pred_chunks = []
-                total_model_batch = latent_model_input.shape[0]
-
                 # ----------------------------------------------------
                 # 16.4 分批跑 UNet
                 #
@@ -524,71 +732,17 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 #   这里分批的是 3N 维度。
                 #   所以所有条件 tensor 都必须已经扩展到 3N。
                 # ----------------------------------------------------
-                for start in range(
-                    0,
-                    total_model_batch,
-                    crop_process_batch_size,
-                ):
-                    end = min(
-                        start + crop_process_batch_size,
-                        total_model_batch,
-                    )
-
-                    # ----------------------------------------------------
-                    # 当前分块的所有输入
-                    # ----------------------------------------------------
-                    latent_chunk = latent_model_input[start:end]
-
-                    image_cond_chunk = image_crop_latents[start:end]
-
-                    mask_cond_chunk = mask_crop_latents[start:end]
-
-                    full_latent_chunk = (
-                        original_latents_full_per_crop[start:end]
-                    )
-
-                    center_chunk = center_maps[start:end]
-
-                    prompt_chunk = prompt_embeds[start:end]
-
-                    # ----------------------------------------------------
-                    # 把当前 chunk 的条件临时保存到 conv_in
-                    #
-                    # 此处只保存 Tensor 引用，不执行可训练计算。
-                    # global_projector 会在 conv_in.forward() 内执行。
-                    # ----------------------------------------------------
-                    
-                    self.unet.conv_in.set_condition_context(
-                        original_crop_latents=image_cond_chunk,
-                        mask_embeds=mask_cond_chunk,
-                        original_latents_full=full_latent_chunk,
-                        center_maps=center_chunk,
-                    )
-
-                    try:
-                        # ------------------------------------------------
-                        # 新版 UNet 只直接接收4通道 noisy latent
-                        #
-                        # 不再构造20通道 model_input。
-                        # ------------------------------------------------
-                        noise_pred_chunk = self.unet(
-                            latent_chunk,
-                            t,
-                            encoder_hidden_states=prompt_chunk,
-                            cross_attention_kwargs=cross_attention_kwargs,
-                            return_dict=False,
-                        )[0]
-
-                    finally:
-                        # 防止长期持有 Tensor 或计算图引用。
-                        # 即使 UNet forward 报错，也会执行清理。
-                        self.unet.conv_in.clear_condition_context()
-
-                    noise_pred_chunks.append(
-                        noise_pred_chunk
-                    )
-
-                crop_noise_pred = torch.cat(noise_pred_chunks, dim=0)
+                crop_noise_pred = self.run_conditioned_unet_in_batches(
+                    latent_model_input=latent_model_input,
+                    timestep=t,
+                    image_condition=image_crop_latents,
+                    mask_condition=mask_crop_latents,
+                    full_image_condition=original_latents_full_per_crop,
+                    center_condition=center_maps,
+                    prompt_embeds=crop_prompt_embeds,
+                    process_batch_size=crop_process_batch_size,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
 
                 # ----------------------------------------------------
                 # 16.4 InstructPix2Pix CFG
@@ -608,18 +762,28 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                         + self.image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                     )
 
+                # 有效 crop 内仍会计算完整 512x512 UNet 输出，以便利用已知
+                # 像素作为条件上下文；但 mask-aware 路径只让修复区域参与
+                # 后续一致性、融合和 scheduler 更新。
+                crop_update_masks = self.crop_latents_from_global(
+                    global_latents=routing_update_mask_latent,
+                    windows=windows,
+                    latent_crop_size=latent_crop_size,
+                )
+
                 # ----------------------------------------------------
                 # 16.5 计算当前 timestep 的动态可信度
                 #
-                # 修复区在第一步的动态可信度为 0，随后从与非修复区
-                # 相邻的位置向内扩散。它只控制动态质量分数的影响，
-                # 不会把修复区重新混回原图 latent。
+                # mask 边缘在早期就保持高可信；可信前沿随后以“前快后慢”
+                # 的速度向中心推进。它同时决定：何时启用局部预测的一致性
+                # /时间稳定性，以及深中心何时从全图结构预测切换到局部细节。
                 # ----------------------------------------------------
                 global_generation_confidence = self.build_generation_confidence_map(
                     repair_mask_latent=repair_mask_latent,
                     repair_distance_latent=repair_distance_latent,
                     step_index=step_index,
                     num_steps=len(timesteps),
+                    propagation_gamma=confidence_propagation_gamma,
                 )
                 crop_generation_confidence = self.crop_latents_from_global(
                     global_latents=global_generation_confidence,
@@ -633,7 +797,8 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     context_radius_pixels=confidence_context_radius,
                 )
                 _, global_crop_coverage = self.fuse_crop_tensors_to_global(
-                    crop_tensors=coverage_crops,
+                    crop_tensors=crop_update_masks,
+                    crop_weights=crop_update_masks,
                     windows=windows,
                     latent_h=latent_h,
                     latent_w=latent_w,
@@ -649,9 +814,14 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 # ----------------------------------------------------
                 # 16.6 先用静态可信度得到基准融合预测
                 #
-                # 静态权重由 crop 边缘质量和局部真实上下文支持组成。
-                # 上下文支持在前期影响更强，随后逐渐回退为 1，让生成
-                # 区内部可在后期依靠模型自身的预测完成细节。
+                # 基础权重只由当前 crop 内可见的真实上下文决定：
+                #
+                #   可见真实区域越多、离当前位置越近 -> 权重越高
+                #   看不见真实区域                     -> 仅保留最小权重
+                #
+                # 不再因像素落在 crop 中心或边缘而额外加、降权。
+                # 后期仍保留一半上下文影响；一致性和时间稳定性在后面
+                # 逐步加入，而不是让“crop 中心”取代真实上下文。
                 # ----------------------------------------------------
                 denoise_progress = (
                     1.0
@@ -661,8 +831,8 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 context_weight = (
                     confidence_min_weight
                     + (1.0 - confidence_min_weight) * crop_context_support
-                ).pow(1.0 - denoise_progress)
-                base_crop_weights = crop_edge_weights * context_weight
+                ).pow(1.0 - 0.5 * denoise_progress)
+                base_crop_weights = context_weight * crop_update_masks
 
                 preliminary_global_noise_pred = self.fuse_crop_tensors_to_global(
                     crop_tensors=crop_noise_pred,
@@ -682,15 +852,16 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     latent_crop_size=latent_crop_size,
                 )
                 agreement_residual = torch.sqrt(
-                    (crop_noise_pred - preliminary_noise_crops).square().mean(
-                        dim=1,
-                        keepdim=True,
+                    self.masked_crop_channel_mse(
+                        values=crop_noise_pred - preliminary_noise_crops,
+                        spatial_mask=crop_update_masks,
                     )
-                    + 1e-8
+                    + 1e-8,
                 )
                 agreement_weights = self.residuals_to_confidence_weights(
                     residuals=agreement_residual,
-                    valid_mask=crop_overlap_counts > 1.0,
+                    valid_mask=(crop_overlap_counts > 1.0)
+                    & (crop_update_masks > 0.0),
                     min_weight=confidence_min_weight,
                 )
 
@@ -721,18 +892,19 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                         latent_crop_size=latent_crop_size,
                     )
                     temporal_residual = torch.sqrt(
-                        (
-                            crop_pred_original_sample
-                            - previous_pred_original_crops
-                        ).square().mean(
-                            dim=1,
-                            keepdim=True,
+                        self.masked_crop_channel_mse(
+                            values=(
+                                crop_pred_original_sample
+                                - previous_pred_original_crops
+                            ),
+                            spatial_mask=crop_update_masks,
                         )
-                        + 1e-8
+                        + 1e-8,
                     )
                     temporal_weights = self.residuals_to_confidence_weights(
                         residuals=temporal_residual,
-                        valid_mask=crop_overlap_counts > 1.0,
+                        valid_mask=(crop_overlap_counts > 1.0)
+                        & (crop_update_masks > 0.0),
                         min_weight=confidence_min_weight,
                     )
                     crop_confidence_weights = crop_confidence_weights * torch.pow(
@@ -752,6 +924,31 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     latent_crop_size=latent_crop_size,
                 )
 
+                # ----------------------------------------------------
+                # 16.10 按距 mask 边缘的传播进度混合全图/局部预测
+                #
+                # global_generation_confidence:
+                #   mask 边缘早期接近 1 -> 相信局部真实上下文
+                #   mask 深中心早期接近 0 -> 相信全图结构预测
+                #
+                # 因此全图分支先把道路和边线的整体信息送进中心，随后
+                # 局部随机窗口逐渐接手高频纹理。
+                # ----------------------------------------------------
+                if global_context_enabled:
+                    coarse_noise_pred_full = F.interpolate(
+                        coarse_noise_pred,
+                        size=(latent_h, latent_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    coarse_blend_weight = global_context_strength * (
+                        1.0 - global_generation_confidence
+                    )
+                    global_noise_pred = (
+                        (1.0 - coarse_blend_weight) * global_noise_pred
+                        + coarse_blend_weight * coarse_noise_pred_full
+                    )
+
                 if crop_pred_original_sample is not None:
                     previous_global_pred_original_sample = (
                         self.predict_original_sample(
@@ -762,7 +959,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                     )
 
                 # ----------------------------------------------------
-                # 16.10 对整张图只执行一次 scheduler.step
+                # 16.11 对整张图只执行一次 scheduler.step
                 #
                 # 此时 model_output 与 sample 都是整图 latent，因此
                 # scheduler 的状态和随机项也只在整图尺度更新一次。
@@ -814,10 +1011,44 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                         # 最后一步去噪完成后，非修复区域直接恢复干净输入 latent。
                         input_latents_noisy = original_latents_full
                     global_latents = (
-                        inpaint_mask_latent * global_latents
-                        + (1.0 - inpaint_mask_latent) * input_latents_noisy
+                        state_inpaint_mask_latent * global_latents
+                        + (
+                            1.0
+                            - state_inpaint_mask_latent
+                        )
+                        * input_latents_noisy
                     )
 
+                # ----------------------------------------------------
+                # 16.12 更新全图低分辨率 latent，并固定其非修复区域。
+                # 它与局部分支使用独立 scheduler 状态，但始终处于同一
+                # timestep；下一步会继续为 mask 深中心提供全图结构信息。
+                # ----------------------------------------------------
+                if global_context_enabled:
+                    coarse_latents = coarse_scheduler.step(
+                        coarse_noise_pred,
+                        t,
+                        coarse_latents,
+                        **coarse_extra_step_kwargs,
+                        return_dict=False,
+                    )[0]
+                    if step_index < len(timesteps) - 1:
+                        coarse_input_latents_noisy = (
+                            coarse_scheduler.add_noise(
+                                original_samples=coarse_original_image_latents,
+                                noise=coarse_noise,
+                                timesteps=next_t_batch,
+                            )
+                        )
+                    else:
+                        coarse_input_latents_noisy = (
+                            coarse_original_image_latents
+                        )
+                    coarse_latents = (
+                        coarse_inpaint_mask_latent * coarse_latents
+                        + (1.0 - coarse_inpaint_mask_latent)
+                        * coarse_input_latents_noisy
+                    )
 
                 # callback
                 if callback_on_step_end is not None:
@@ -1165,6 +1396,104 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         return latents, noisy
 
     # ================================================================
+    # 全图低分辨率结构分支
+    # ================================================================
+    def get_global_context_latent_size(
+        self,
+        latent_h: int,
+        latent_w: int,
+        max_latent_side: int,
+    ):
+        """返回与训练 crop 一致的方形全图结构网格尺寸。"""
+
+        if max_latent_side <= 0:
+            raise ValueError("max_latent_side 必须大于 0。")
+
+        downsample_alignment = 2 ** (
+            len(self.unet.config.block_out_channels) - 1
+        )
+        if max_latent_side < downsample_alignment:
+            raise ValueError(
+                "全图分支的 latent 尺寸过小，"
+                f"至少需要 {downsample_alignment}。"
+            )
+
+        if max_latent_side % downsample_alignment != 0:
+            raise ValueError(
+                "全图结构分支尺寸必须满足 UNet 下采样对齐，"
+                f"实际为 {max_latent_side}，对齐要求为 "
+                f"{downsample_alignment}。"
+            )
+
+        # ContentAwarePositionGatedConvIn 的 global_projector 输出固定为
+        # 训练 crop 尺寸；全图分支必须使用相同方形尺寸，避免条件特征与
+        # noisy latent 的空间尺寸不一致。
+        return max_latent_side, max_latent_side
+
+    def normalize_noise_to_unit_variance(self, noise: torch.Tensor):
+        """补偿 area 下采样造成的噪声方差下降。"""
+
+        noise_std = noise.flatten(start_dim=1).std(
+            dim=1,
+            unbiased=False,
+        ).view(-1, 1, 1, 1)
+        return noise / noise_std.clamp(min=1e-6)
+
+    def run_conditioned_unet_in_batches(
+        self,
+        latent_model_input: torch.Tensor,
+        timestep,
+        image_condition: torch.Tensor,
+        mask_condition: torch.Tensor,
+        full_image_condition: torch.Tensor,
+        center_condition: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        process_batch_size: int,
+        cross_attention_kwargs: dict[str, Any] | None,
+    ):
+        """以相同的条件注入方式运行局部或全图 UNet 分支。"""
+
+        total_batch = latent_model_input.shape[0]
+        condition_tensors = {
+            "image_condition": image_condition,
+            "mask_condition": mask_condition,
+            "full_image_condition": full_image_condition,
+            "center_condition": center_condition,
+            "prompt_embeds": prompt_embeds,
+        }
+        for name, tensor in condition_tensors.items():
+            if tensor.shape[0] != total_batch:
+                raise ValueError(
+                    f"{name} 的 batch={tensor.shape[0]}，"
+                    f"但 latent batch={total_batch}。"
+                )
+
+        noise_pred_chunks = []
+        for start in range(0, total_batch, process_batch_size):
+            end = min(start + process_batch_size, total_batch)
+            self.unet.conv_in.set_condition_context(
+                original_crop_latents=image_condition[start:end],
+                mask_embeds=mask_condition[start:end],
+                original_latents_full=full_image_condition[start:end],
+                center_maps=center_condition[start:end],
+            )
+
+            try:
+                noise_pred_chunk = self.unet(
+                    latent_model_input[start:end],
+                    timestep,
+                    encoder_hidden_states=prompt_embeds[start:end],
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    return_dict=False,
+                )[0]
+            finally:
+                self.unet.conv_in.clear_condition_context()
+
+            noise_pred_chunks.append(noise_pred_chunk)
+
+        return torch.cat(noise_pred_chunks, dim=0)
+
+    # ================================================================
     # 从整图 latent 上切 crop
     # ================================================================
     def crop_latents_from_global(
@@ -1339,27 +1668,48 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
 
         return global_tensor
 
+    def masked_crop_channel_mse(
+        self,
+        values: torch.Tensor,
+        spatial_mask: torch.Tensor,
+    ):
+        """计算仅在修复区域有效的逐像素通道平均 MSE。
+
+        ``values`` 是 [N,C,H,W]，而 ``spatial_mask`` 是 [N,1,H,W]。
+        这样 mask-aware 路径中的一致性/时间稳定性不会被已知背景的预测
+        差异主导。
+        """
+
+        if values.ndim != 4 or spatial_mask.ndim != 4:
+            raise ValueError("values 与 spatial_mask 都必须是四维 Tensor。")
+        if (
+            values.shape[0] != spatial_mask.shape[0]
+            or values.shape[-2:] != spatial_mask.shape[-2:]
+            or spatial_mask.shape[1] != 1
+        ):
+            raise ValueError(
+                "values 应为 [N,C,H,W]、spatial_mask 应为 [N,1,H,W]，"
+                f"实际为 {tuple(values.shape)} 与 {tuple(spatial_mask.shape)}。"
+            )
+
+        # 保持 [N,1,H,W] 形状，以便 residuals_to_confidence_weights 能够
+        # 针对同一空间位置的重叠预测计算自适应尺度。mask 外值会被置零，
+        # 并由调用方的 valid_mask 排除，不参与统计或融合。
+        return values.square().mean(dim=1, keepdim=True) * spatial_mask
+
     # ================================================================
-    # 多维融合可信度：静态空间部分
+    # 多维融合可信度：整图静态部分
     # ================================================================
-    def prepare_crop_confidence_maps(
+    def prepare_global_confidence_maps(
         self,
         inpaint_mask: torch.Tensor,
-        windows: list[dict],
         latent_h: int,
         latent_w: int,
-        latent_crop_size: int,
-        context_radius_pixels: int,
-        min_weight: float,
     ):
         """
-        创建不随 timestep 变化的融合可信度图。
+        创建不随 timestep 变化的整图可信度图。
 
         返回：
-            crop_edge_weights:
-                [N, 1, Hc, Wc]，中心高、边缘低。
-            crop_context_support:
-                [N, 1, Hc, Wc]，仅在当前 crop 内统计的非修复区比例。
             repair_mask_latent:
                 [1, 1, H, W]，修复区为 1。
             repair_distance_latent:
@@ -1382,35 +1732,6 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             mode="area",
         ).clamp(0.0, 1.0)
 
-        crop_context_support = self.prepare_crop_context_support(
-            repair_mask_latent=repair_mask_latent,
-            windows=windows,
-            latent_crop_size=latent_crop_size,
-            context_radius_pixels=context_radius_pixels,
-        )
-
-        coordinates = torch.linspace(
-            -1.0,
-            1.0,
-            latent_crop_size,
-            device=device,
-            dtype=dtype,
-        )
-        one_dimensional_hann = 0.5 * (
-            torch.cos(torch.pi * coordinates) + 1.0
-        )
-        edge_window = torch.outer(
-            one_dimensional_hann,
-            one_dimensional_hann,
-        )[None, None]
-        crop_edge_weights = min_weight + (1.0 - min_weight) * edge_window
-        crop_edge_weights = crop_edge_weights.expand(
-            len(windows),
-            -1,
-            -1,
-            -1,
-        )
-
         repair_mask_np = (
             repair_mask_pixels[0, 0]
             .detach()
@@ -1420,7 +1741,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         )
         if np.all(repair_mask_np == 1):
             # 没有已知区域时无法定义空间传播方向，退化为仅随时间增长
-            # 的可信度；边缘、一致性和时间稳定性权重仍会继续工作。
+            # 的可信度；一致性和时间稳定性权重仍会继续工作。
             repair_distance_pixels = np.zeros_like(
                 repair_mask_np,
                 dtype=np.float32,
@@ -1438,12 +1759,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             align_corners=False,
         ).to(device=device, dtype=dtype)
 
-        return (
-            crop_edge_weights,
-            crop_context_support,
-            repair_mask_latent,
-            repair_distance_latent,
-        )
+        return repair_mask_latent, repair_distance_latent
 
     def prepare_crop_context_support(
         self,
@@ -1491,16 +1807,20 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         repair_distance_latent: torch.Tensor,
         step_index: int,
         num_steps: int,
+        propagation_gamma: float,
     ):
         """
         修复区域的动态可信度图。
 
-        第一个 timestep 在修复区为 0；随着去噪进度增加，可信度从
-        非修复边界向修复区内部推进。非修复区恒为 1。
+        mask 边缘从第一个 timestep 起就保持高可信；随后可信前沿按
+        “前快后慢”的曲线快速向修复区中心推进。非修复区恒为 1。
         """
 
         if num_steps <= 0:
             raise ValueError("num_steps 必须大于 0。")
+
+        if propagation_gamma <= 0.0:
+            raise ValueError("propagation_gamma 必须大于 0。")
 
         progress = (
             1.0
@@ -1509,13 +1829,27 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         )
         max_distance = repair_distance_latent.max()
         transition_width = torch.clamp(max_distance * 0.05, min=1.0)
-        propagation_radius = progress * (
-            max_distance + 3.0 * transition_width
-        )
-
-        repair_confidence = progress * torch.sigmoid(
-            (propagation_radius - repair_distance_latent) / transition_width
-        )
+        if max_distance <= 1e-6:
+            repair_confidence = torch.full_like(
+                repair_mask_latent,
+                progress,
+            )
+        else:
+            # t=0 时，已知边界内侧约 3 个过渡带宽已可用；gamma > 1
+            # 使前沿在早期迅速推进，避免 1024 级大 mask 的中心直到
+            # 最后几步才开始得到可靠结构信息。
+            accelerated_progress = 1.0 - (1.0 - progress) ** (
+                propagation_gamma
+            )
+            initial_radius = 3.0 * transition_width
+            final_radius = max_distance + 3.0 * transition_width
+            propagation_radius = initial_radius + (
+                final_radius - initial_radius
+            ) * accelerated_progress
+            repair_confidence = torch.sigmoid(
+                (propagation_radius - repair_distance_latent)
+                / transition_width
+            )
 
         return (
             1.0 - repair_mask_latent
@@ -1825,6 +2159,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         self,
         generator: torch.Generator | list[torch.Generator] | None,
         window_seed: int | None,
+        seed_offset: int = 0,
     ):
         """
         建立独立的 CPU 随机数发生器，避免窗口随机性消耗 diffusion 的
@@ -1843,7 +2178,9 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 window_seed = torch.initial_seed()
 
         window_generator = torch.Generator(device="cpu")
-        window_generator.manual_seed(int(window_seed))
+        window_generator.manual_seed(
+            (int(window_seed) + seed_offset) % (2**63 - 1)
+        )
 
         return window_generator
 
@@ -1933,6 +2270,175 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             *[start + offset for start in base_starts[1:-1]],
             base_starts[-1],
         ]
+
+    # ================================================================
+    # mask-aware 窗口路由
+    # ================================================================
+    def build_mask_aware_base_windows(
+        self,
+        repair_mask: np.ndarray,
+        base_tops: list[int],
+        base_lefts: list[int],
+        crop_size: int,
+        min_known_fraction: float,
+    ):
+        """从规则网格筛选与修复区相关的基础窗口。
+
+        所有保留窗口都至少包含一个修复像素。包含足够已知像素的窗口被
+        标记为边界锚点；后续随机抖动时仍必须保持这些上下文。完全位于
+        大 mask 内部的窗口作为桥接窗口保留，保证深中心也能被覆盖。
+        """
+
+        if repair_mask.ndim != 2:
+            raise ValueError(
+                f"repair_mask 必须是 [H,W]，实际为 {repair_mask.shape}。"
+            )
+        if not 0.0 <= min_known_fraction <= 1.0:
+            raise ValueError("min_known_fraction 必须在 [0, 1] 内。")
+
+        repair_mask = repair_mask.astype(bool, copy=False)
+        windows = []
+        for top in base_tops:
+            for left in base_lefts:
+                mask_crop = repair_mask[
+                    top : top + crop_size,
+                    left : left + crop_size,
+                ]
+                if not np.any(mask_crop):
+                    continue
+                known_fraction = 1.0 - float(mask_crop.mean())
+                windows.append(
+                    {
+                        "pixel_top": int(top),
+                        "pixel_left": int(left),
+                        "requires_known_context": (
+                            known_fraction >= min_known_fraction
+                        ),
+                    }
+                )
+        return windows
+
+    def sample_mask_aware_pixel_windows(
+        self,
+        base_windows: list[dict],
+        repair_mask: np.ndarray,
+        image_h: int,
+        image_w: int,
+        crop_size: int,
+        jitter_pixels: int,
+        min_known_fraction: float,
+        max_attempts: int,
+        generator: torch.Generator,
+    ):
+        """随机抖动有效窗口，并补回抖动造成的修复区覆盖空洞。
+
+        与常规整图滑窗不同，此函数不会产生 mask 外窗口。对于被标记为
+        边界锚点的基础窗口，随机位置必须同时包含修复区和足够已知上下文；
+        若找不到合法偏移，则保留其基础位置。
+        """
+
+        if not base_windows:
+            raise ValueError("base_windows 不能为空。")
+        if repair_mask.shape != (image_h, image_w):
+            raise ValueError(
+                "repair_mask 尺寸必须与图像一致："
+                f"{repair_mask.shape} vs {(image_h, image_w)}。"
+            )
+        if max_attempts < 1:
+            raise ValueError("max_attempts 必须大于等于 1。")
+
+        repair_mask = repair_mask.astype(bool, copy=False)
+        alignment = self.vae_scale_factor
+        jitter_units = jitter_pixels // alignment
+        selected_windows = []
+        selected_positions: set[tuple[int, int]] = set()
+
+        def is_valid(top: int, left: int, requires_known_context: bool) -> bool:
+            mask_crop = repair_mask[
+                top : top + crop_size,
+                left : left + crop_size,
+            ]
+            if not np.any(mask_crop):
+                return False
+            if not requires_known_context:
+                return True
+            known_fraction = 1.0 - float(mask_crop.mean())
+            return known_fraction >= min_known_fraction
+
+        def append_window(top: int, left: int) -> None:
+            key = (top, left)
+            if key not in selected_positions:
+                selected_positions.add(key)
+                selected_windows.append(
+                    {"pixel_top": int(top), "pixel_left": int(left)}
+                )
+
+        for base_window in base_windows:
+            base_top = int(base_window["pixel_top"])
+            base_left = int(base_window["pixel_left"])
+            requires_known_context = bool(
+                base_window["requires_known_context"]
+            )
+            selected_top, selected_left = base_top, base_left
+
+            for _ in range(max_attempts):
+                if jitter_units == 0:
+                    break
+                top_offset = int(
+                    torch.randint(
+                        -jitter_units,
+                        jitter_units + 1,
+                        (1,),
+                        generator=generator,
+                    ).item()
+                ) * alignment
+                left_offset = int(
+                    torch.randint(
+                        -jitter_units,
+                        jitter_units + 1,
+                        (1,),
+                        generator=generator,
+                    ).item()
+                ) * alignment
+                top = min(max(base_top + top_offset, 0), image_h - crop_size)
+                left = min(max(base_left + left_offset, 0), image_w - crop_size)
+                if is_valid(top, left, requires_known_context):
+                    selected_top, selected_left = top, left
+                    break
+
+            # 基础窗口来自完整覆盖网格，且已经验证过含 mask，因此无论抖动
+            # 是否成功都可以作为安全回退。
+            append_window(selected_top, selected_left)
+
+        # 独立抖动会让少量 mask 像素暂时落在所有窗口外。扫描并补入能够
+        # 覆盖这些空洞的基础窗口，确保每个修复像素每步至少有一个预测。
+        uncovered = repair_mask.copy()
+        for window in selected_windows:
+            top, left = window["pixel_top"], window["pixel_left"]
+            uncovered[top : top + crop_size, left : left + crop_size] = False
+
+        if np.any(uncovered):
+            for base_window in base_windows:
+                top = int(base_window["pixel_top"])
+                left = int(base_window["pixel_left"])
+                if np.any(
+                    uncovered[
+                        top : top + crop_size,
+                        left : left + crop_size,
+                    ]
+                ):
+                    append_window(top, left)
+                    uncovered[
+                        top : top + crop_size,
+                        left : left + crop_size,
+                    ] = False
+                if not np.any(uncovered):
+                    break
+
+        if np.any(uncovered):
+            raise RuntimeError("mask-aware 窗口未能覆盖全部修复像素。")
+
+        return selected_windows
 
     # ================================================================
     # 像素空间窗口生成
