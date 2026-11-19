@@ -45,7 +45,13 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    DDPMScheduler,
+    StableDiffusionInstructPix2PixPipeline,
+    UNet2DConditionModel,
+)
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
@@ -117,7 +123,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
+        default=None,   
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
@@ -306,6 +312,27 @@ def parse_args():
         help="Conditioning dropout probability. Drops out the conditionings (image and edit prompt) used in training InstructPix2Pix. See section 3.2.1 in the paper: https://huggingface.co/papers/2211.09800.",
     )
     parser.add_argument(
+        "--online_thumbnail_num_inference_steps",
+        type=int,
+        default=10,
+        help=(
+            "Number of no-gradient DDIM steps used to generate the current "
+            "model's 512x512 thumbnail prediction for crop conditioning."
+        ),
+    )
+    parser.add_argument(
+        "--online_thumbnail_guidance_scale",
+        type=float,
+        default=3.0,
+        help="Text guidance scale for online thumbnail prediction.",
+    )
+    parser.add_argument(
+        "--online_thumbnail_image_guidance_scale",
+        type=float,
+        default=2.0,
+        help="Image guidance scale for online thumbnail prediction.",
+    )
+    parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
@@ -415,6 +442,9 @@ def parse_args():
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
+    if args.online_thumbnail_num_inference_steps <= 0:
+        raise ValueError("online_thumbnail_num_inference_steps must be positive.")
+
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
@@ -470,7 +500,14 @@ def main():
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
 
-    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+    training_generator_seed = (
+        args.seed
+        if args.seed is not None
+        else int(torch.initial_seed() % (2**63 - 1))
+    )
+    generator = torch.Generator(device=accelerator.device).manual_seed(
+        training_generator_seed
+    )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -504,6 +541,11 @@ def main():
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    # Keep online thumbnail sampling state completely separate from the
+    # forward-noising scheduler used by the training objective.
+    online_thumbnail_scheduler = DDIMScheduler.from_config(
+        noise_scheduler.config
+    )
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
@@ -543,6 +585,8 @@ def main():
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    vae.eval()
+    text_encoder.eval()
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -566,20 +610,24 @@ def main():
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
-    # `accelerate` 0.16.0 will have better support for customized saving
-    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
-                if args.use_ema:
-                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+    # Custom save/load hooks are required because the custom conv_in module is
+    # serialized under checkpoint-*/unet rather than Accelerate's default
+    # model.safetensors location.
+    if version.parse(accelerate.__version__) < version.parse("0.16.0"):
+        raise RuntimeError("Resumable training with the custom UNet requires accelerate >= 0.16.0.")
 
-                for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            if args.use_ema:
+                ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
-                    # make sure to pop weight so that corresponding model is not saved again
-                    if weights:
-                        weights.pop()
+            for model in models:
+                unwrap_model(model).save_pretrained(os.path.join(output_dir, "unet"))
+
+                # Prevent duplicate default serialization; load_model_hook
+                # restores this exact checkpoint/unet artifact explicitly.
+                if weights:
+                    weights.pop()
 
     def load_model_hook(models, input_dir):
         if args.use_ema:
@@ -591,19 +639,33 @@ def main():
             ema_unet.to(accelerator.device)
             del load_model
 
-        for i in range(len(models)):
-            model = models.pop()
+        unet_dir = os.path.join(input_dir, "unet")
+        safetensor_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
+        bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
 
-            # 不要手动找 input_dir/unet
-            # 因为 checkpoint-20000 是 accelerate state 格式：
-            # checkpoint-20000/model.safetensors
-            # checkpoint-20000/optimizer.bin
-            # checkpoint-20000/scheduler.bin
-            #
-            # 真正的 model.safetensors 会由 accelerator.load_state()
-            # 在 hook 执行后自动加载。
+        if os.path.isfile(safetensor_path):
+            from safetensors.torch import load_file
 
-            model.register_to_config(in_channels=20)
+            state_dict = load_file(safetensor_path, device="cpu")
+        elif os.path.isfile(bin_path):
+            state_dict = torch.load(bin_path, map_location="cpu")
+        else:
+            raise FileNotFoundError(
+                "Cannot resume custom UNet: expected either "
+                f"'{safetensor_path}' or '{bin_path}'."
+            )
+
+        while models:
+            model = unwrap_model(models.pop())
+
+            # ContentAwarePositionGatedConvIn directly receives four-channel
+            # noisy latents. Keep the serialized UNet config aligned with the
+            # unchanged custom architecture before loading its exact weights.
+            model.register_to_config(in_channels=4)
+            model.load_state_dict(state_dict, strict=True)
+
+        logger.info(f"Restored custom UNet weights from {unet_dir}")
+
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
 
@@ -744,7 +806,398 @@ def main():
     import xml.etree.ElementTree as ET
     import numpy as np
     import random
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
+
+    crop_pixel_size = 512
+    crop_latent_size = crop_pixel_size // 8
+    num_crops_per_image = 8
+
+    try:
+        image_resize_mode = Image.Resampling.BICUBIC
+        mask_resize_mode = Image.Resampling.NEAREST
+        box_resize_mode = Image.Resampling.BOX
+        affine_transform_mode = Image.Transform.AFFINE
+    except AttributeError:
+        image_resize_mode = Image.BICUBIC
+        mask_resize_mode = Image.NEAREST
+        box_resize_mode = Image.BOX
+        affine_transform_mode = Image.AFFINE
+
+    def get_letterbox_geometry(image_size, output_size=crop_pixel_size):
+        """Return one shared aspect-ratio-preserving resize/padding geometry."""
+        image_w, image_h = image_size
+        if image_w <= 0 or image_h <= 0:
+            raise ValueError(f"Invalid image size for letterboxing: {image_size}")
+
+        scale = min(output_size / image_w, output_size / image_h)
+        resized_w = max(1, min(output_size, round(image_w * scale)))
+        resized_h = max(1, min(output_size, round(image_h * scale)))
+        left = (output_size - resized_w) // 2
+        top = (output_size - resized_h) // 2
+        return resized_w, resized_h, left, top
+
+    def resize_and_letterbox(image, geometry, resample):
+        """Resize an image in pixel space and center it on a black 512x512 canvas."""
+        resized_w, resized_h, left, top = geometry
+        resized = image.resize((resized_w, resized_h), resample=resample)
+        canvas = Image.new(image.mode, (crop_pixel_size, crop_pixel_size), color=0)
+        canvas.paste(resized, (left, top))
+        return canvas
+
+    def remove_letterbox(image, geometry):
+        """Remove the artificial black letterbox border."""
+        resized_w, resized_h, left, top = geometry
+        return image.crop((left, top, left + resized_w, top + resized_h))
+
+    def simulate_thumbnail_prediction_errors(thumbnail):
+        """Approximate common 512px global-restoration errors without inference."""
+        thumbnail = thumbnail.convert("RGB")
+        width, height = thumbnail.size
+
+        # Most generated thumbnails are only mildly wrong. A small fraction
+        # receives medium corruption so the crop branch also learns to repair
+        # the less successful global predictions seen at inference time.
+        severity_draw = random.random()
+        if severity_draw < 0.15:
+            severity = random.uniform(0.20, 0.45)
+        elif severity_draw < 0.85:
+            severity = random.uniform(0.45, 0.90)
+        else:
+            severity = random.uniform(0.90, 1.25)
+
+        # Apply one small, spatially uniform RGB cast to the whole thumbnail
+        # prediction. The final native-resolution composite confines this to
+        # the repair region and makes rectangular tone steps similar to real
+        # failed global predictions.
+        thumbnail_array = np.asarray(
+            thumbnail,
+            dtype=np.float32,
+        )
+        channel_gains = np.array(
+            [
+                random.uniform(
+                    1.0 - 0.025 * severity,
+                    1.0 + 0.025 * severity,
+                )
+                for _ in range(3)
+            ],
+            dtype=np.float32,
+        ).reshape(1, 1, 3)
+        channel_biases = np.array(
+            [
+                random.uniform(-4.0 * severity, 4.0 * severity)
+                for _ in range(3)
+            ],
+            dtype=np.float32,
+        ).reshape(1, 1, 3)
+        thumbnail_array = np.clip(
+            thumbnail_array * channel_gains + channel_biases,
+            0,
+            255,
+        ).astype(np.uint8)
+        thumbnail = Image.fromarray(thumbnail_array, mode="RGB")
+
+        # Real global predictions often contain broad, non-uniform luminance
+        # drift or soft dark/light areas instead of a single constant RGB
+        # offset. Create a tiny random field and bicubic-upsample it so only
+        # very low spatial frequencies are changed.
+        if random.random() < 0.85:
+            grid_w = random.randint(3, 5)
+            grid_h = random.randint(3, 5)
+            luminance = np.random.uniform(
+                -1.0,
+                1.0,
+                size=(grid_h, grid_w, 1),
+            ).astype(np.float32)
+            chroma = np.random.uniform(
+                -1.0,
+                1.0,
+                size=(grid_h, grid_w, 3),
+            ).astype(np.float32)
+            field_delta = (
+                luminance * (8.0 * severity)
+                + chroma * (2.5 * severity)
+            )
+            field_array = np.clip(
+                128.0 + field_delta,
+                0,
+                255,
+            ).astype(np.uint8)
+            color_field = Image.fromarray(
+                field_array,
+                mode="RGB",
+            ).resize(
+                (width, height),
+                resample=image_resize_mode,
+            )
+            thumbnail = ImageChops.add(
+                thumbnail,
+                color_field,
+                scale=1.0,
+                offset=-128,
+            )
+
+        # Small translation/scale/rotation errors reproduce displaced cracks,
+        # lane markings and road texture at the generated-region boundary.
+        if random.random() < 0.70:
+            effective_scale = max(width, height) / crop_pixel_size
+            translate_x = random.uniform(-4.0, 4.0) * severity * effective_scale
+            translate_y = random.uniform(-4.0, 4.0) * severity * effective_scale
+            affine_scale = random.uniform(
+                1.0 - 0.015 * severity,
+                1.0 + 0.015 * severity,
+            )
+            angle = math.radians(
+                random.uniform(-0.40, 0.40) * severity
+            )
+            cos_angle = math.cos(angle) / affine_scale
+            sin_angle = math.sin(angle) / affine_scale
+            center_x = (width - 1) * 0.5
+            center_y = (height - 1) * 0.5
+            affine_data = (
+                cos_angle,
+                sin_angle,
+                center_x
+                - cos_angle * center_x
+                - sin_angle * center_y
+                - translate_x,
+                -sin_angle,
+                cos_angle,
+                center_y
+                + sin_angle * center_x
+                - cos_angle * center_y
+                - translate_y,
+            )
+            fill_color = thumbnail.resize(
+                (1, 1),
+                resample=box_resize_mode,
+            ).getpixel((0, 0))
+            thumbnail = thumbnail.transform(
+                (width, height),
+                affine_transform_mode,
+                affine_data,
+                resample=image_resize_mode,
+                fillcolor=fill_color,
+            )
+
+        # Suppress high-frequency texture by an extra down/up pass. This is
+        # independent of the original native->512 resize and approximates a
+        # global model that reconstructs layout but misses pavement detail.
+        if random.random() < 0.85:
+            retain_ratio = max(
+                0.55,
+                1.0 - random.uniform(0.10, 0.35) * severity,
+            )
+            reduced_size = (
+                max(8, round(width * retain_ratio)),
+                max(8, round(height * retain_ratio)),
+            )
+            thumbnail = thumbnail.resize(
+                reduced_size,
+                resample=image_resize_mode,
+            ).resize(
+                (width, height),
+                resample=image_resize_mode,
+            )
+
+        blur_radius = random.uniform(0.35, 1.50) * severity
+        thumbnail = thumbnail.filter(
+            ImageFilter.GaussianBlur(radius=blur_radius)
+        )
+
+        # Add occasional soft stains or bands. These emulate the diffuse dark
+        # blobs and low-frequency striping visible in unsuccessful thumbnail
+        # restorations, while avoiding hard synthetic shapes.
+        if random.random() < 0.25 + 0.30 * severity:
+            artifact_mask = Image.new("L", (width, height), color=0)
+            draw = ImageDraw.Draw(artifact_mask)
+            artifact_count = 1 if random.random() < 0.8 else 2
+            for _ in range(artifact_count):
+                shape_type = random.random()
+                if shape_type < 0.55:
+                    artifact_w = random.uniform(0.10, 0.32) * width
+                    artifact_h = random.uniform(0.08, 0.25) * height
+                elif shape_type < 0.78:
+                    artifact_w = random.uniform(0.45, 0.90) * width
+                    artifact_h = random.uniform(0.04, 0.12) * height
+                else:
+                    artifact_w = random.uniform(0.04, 0.12) * width
+                    artifact_h = random.uniform(0.40, 0.85) * height
+
+                left = random.uniform(-0.05, 0.95) * width
+                top = random.uniform(-0.05, 0.95) * height
+                right = left + artifact_w
+                bottom = top + artifact_h
+                artifact_alpha = round(
+                    random.uniform(0.08, 0.20)
+                    * min(severity, 1.0)
+                    * 255
+                )
+                if shape_type < 0.55:
+                    draw.ellipse(
+                        (left, top, right, bottom),
+                        fill=artifact_alpha,
+                    )
+                else:
+                    draw.rectangle(
+                        (left, top, right, bottom),
+                        fill=artifact_alpha,
+                    )
+
+            artifact_mask = artifact_mask.filter(
+                ImageFilter.GaussianBlur(
+                    radius=random.uniform(5.0, 18.0)
+                )
+            )
+            softened = thumbnail.filter(
+                ImageFilter.GaussianBlur(
+                    radius=random.uniform(1.5, 4.0) * severity
+                )
+            )
+            thumbnail = Image.composite(
+                softened,
+                thumbnail,
+                artifact_mask,
+            )
+
+            mean_color = np.array(
+                thumbnail.resize(
+                    (1, 1),
+                    resample=box_resize_mode,
+                ).getpixel((0, 0)),
+                dtype=np.float32,
+            )
+            signed_shift = random.choice((-1.0, 1.0))
+            common_shift = signed_shift * random.uniform(15.0, 38.0)
+            color_shift = np.random.uniform(-5.0, 5.0, size=3)
+            artifact_color = tuple(
+                np.clip(
+                    mean_color + common_shift + color_shift,
+                    0,
+                    255,
+                ).astype(np.uint8).tolist()
+            )
+            artifact_layer = Image.new(
+                "RGB",
+                (width, height),
+                artifact_color,
+            )
+            thumbnail = Image.composite(
+                artifact_layer,
+                thumbnail,
+                artifact_mask,
+            )
+
+        return thumbnail, severity
+
+    def add_subtle_boundary_artifacts(
+        thumbnail_prior,
+        inpaint_mask,
+        severity,
+    ):
+        """Add a faint native-resolution seam on some repair boundaries."""
+        if random.random() > 0.35:
+            return thumbnail_prior
+
+        native_scale = max(thumbnail_prior.size) / crop_pixel_size
+
+        # Add a subtle repair-side seam only. inpaint_mask uses white=1 for
+        # the repair area, therefore mask - eroded(mask) is an inner contour
+        # ring. The faint dark/red tint prevents the crop model from relying
+        # on a perfectly clean thumbnail-to-known-pixel boundary.
+        edge_width = min(
+            6,
+            max(
+                1,
+                round(
+                    random.uniform(0.35, 0.90)
+                    * native_scale
+                    * severity
+                ),
+            ),
+        )
+        repair_bbox = inpaint_mask.getbbox()
+        if repair_bbox is not None:
+            repair_width = repair_bbox[2] - repair_bbox[0]
+            repair_height = repair_bbox[3] - repair_bbox[1]
+            # Preserve a central coarse silhouette even for small defects.
+            edge_width = min(
+                edge_width,
+                max(1, min(repair_width, repair_height) // 4),
+            )
+        eroded_mask = inpaint_mask.filter(
+            ImageFilter.MinFilter(size=2 * edge_width + 1)
+        )
+        inner_edge_mask = ImageChops.subtract(inpaint_mask, eroded_mask)
+        inner_edge_mask = inner_edge_mask.filter(
+            ImageFilter.GaussianBlur(
+                radius=max(0.5, 0.20 * native_scale)
+            )
+        )
+
+        mean_color = np.array(
+            thumbnail_prior.resize(
+                (1, 1),
+                resample=box_resize_mode,
+            ).getpixel((0, 0)),
+            dtype=np.float32,
+        )
+        edge_type = random.random()
+        if edge_type < 0.75:
+            neutral_shift = random.choice((-1.0, 1.0)) * random.uniform(15, 30)
+            edge_color = tuple(
+                np.clip(
+                    mean_color + neutral_shift,
+                    0,
+                    255,
+                ).astype(np.uint8).tolist()
+            )
+        elif edge_type < 0.93:
+            edge_color = tuple(
+                np.clip(
+                    mean_color - random.uniform(35, 75),
+                    0,
+                    255,
+                ).astype(np.uint8).tolist()
+            )
+        else:
+            edge_color = tuple(
+                np.clip(
+                    mean_color
+                    + np.array(
+                        [
+                            random.uniform(25, 45),
+                            random.uniform(-20, -8),
+                            random.uniform(-20, -8),
+                        ],
+                        dtype=np.float32,
+                    ),
+                    0,
+                    255,
+                ).astype(np.uint8).tolist()
+            )
+        corrupted_edge = Image.new(
+            "RGB",
+            thumbnail_prior.size,
+            edge_color,
+        )
+        subtle_edge = Image.blend(
+            thumbnail_prior,
+            corrupted_edge,
+            alpha=random.uniform(0.02, 0.07) * min(severity, 1.0),
+        )
+        return Image.composite(
+            subtle_edge,
+            thumbnail_prior,
+            inner_edge_mask,
+        )
+
+    def make_letterbox_valid_mask(geometry):
+        """Mark real image pixels as 1 and artificial black padding as 0."""
+        resized_w, resized_h, left, top = geometry
+        valid_mask = Image.new("L", (crop_pixel_size, crop_pixel_size), color=0)
+        valid_mask.paste(255, (left, top, left + resized_w, top + resized_h))
+        return valid_mask
 
     def parse_boxes_from_xml(xml_path):
         try:
@@ -865,8 +1318,6 @@ def main():
         return np.stack(centers, axis=0).astype(np.float32)
         
 
-    num_crops_per_image = 8
-    
     # 辅助函数：解析 XML，返回所有 box 的列表，每个 box 为 (xmin, ymin, xmax, ymax)
     def preprocess_images(examples):
         edits = examples[edited_image_column]
@@ -878,6 +1329,11 @@ def main():
         processed_edits = []
         processed_inpaint_masks = []
         processed_centers = []
+        processed_global_originals = []
+        processed_global_edits = []
+        processed_global_masks = []
+        processed_global_inpaint_masks = []
+        processed_global_valid_masks = []
 
         for edit_path, box_path, mask_path in zip(edits, box_urls, masks):
             large_region_size = random.randint(768, 1280)
@@ -909,6 +1365,16 @@ def main():
             mask = mask.crop((0, 0, new_w, new_h))
             inpaint_mask = inpaint_mask.crop((0, 0, new_w, new_h))
 
+            # One of the eight expanded samples is trained as a whole-image
+            # restoration task. Resize in pixel space before VAE encoding so
+            # this branch represents the complete image, not a resized latent.
+            letterbox_geometry = get_letterbox_geometry(orig.size)
+            global_orig = resize_and_letterbox(orig, letterbox_geometry, image_resize_mode)
+            global_edit = resize_and_letterbox(edit, letterbox_geometry, image_resize_mode)
+            global_mask = resize_and_letterbox(mask, letterbox_geometry, mask_resize_mode)
+            global_inpaint_mask = resize_and_letterbox(inpaint_mask, letterbox_geometry, mask_resize_mode)
+            global_valid_mask = make_letterbox_valid_mask(letterbox_geometry)
+
             centers = choose_multiple_relative_centers_from_xml(
                 xml_path=box_path,
                 image_w=new_w,
@@ -926,17 +1392,49 @@ def main():
             inpaint_mask_np = convert_to_np(inpaint_mask)
             inpaint_mask_np = inpaint_mask_np / 255.0
 
+            # Keep the existing mask loading behavior unchanged, but fail with
+            # a useful message if the dataset violates the one-channel
+            # contract required by [mask, mask, inpaint_mask] packing.
+            if mask_np.shape[0] != 1:
+                raise ValueError(
+                    "Dataset mask must be single-channel before condition "
+                    f"packing, but '{mask_path}' has {mask_np.shape[0]} "
+                    "channels."
+                )
+            if inpaint_mask_np.shape[0] != 1:
+                raise ValueError(
+                    "Inpaint mask must be single-channel before condition "
+                    f"packing, but the mask derived from '{box_path}' has "
+                    f"{inpaint_mask_np.shape[0]} channels."
+                )
+
+            global_orig_np = convert_to_np(global_orig)
+            global_edit_np = convert_to_np(global_edit)
+            global_mask_np = convert_to_np(global_mask) / 255.0
+            global_inpaint_mask_np = convert_to_np(global_inpaint_mask) / 255.0
+            global_valid_mask_np = convert_to_np(global_valid_mask) / 255.0
+
             processed_originals.append(orig_np)
             processed_masks.append(mask_np)
             processed_edits.append(edit_np)
             processed_inpaint_masks.append(inpaint_mask_np)
             processed_centers.append(centers)
+            processed_global_originals.append(global_orig_np)
+            processed_global_edits.append(global_edit_np)
+            processed_global_masks.append(global_mask_np)
+            processed_global_inpaint_masks.append(global_inpaint_mask_np)
+            processed_global_valid_masks.append(global_valid_mask_np)
 
         original_images = np.stack(processed_originals)
         mask_images = np.stack(processed_masks)
         edited_images = np.stack(processed_edits)
         inpaint_masks = np.stack(processed_inpaint_masks)
         centers = np.stack(processed_centers)
+        global_original_images = np.stack(processed_global_originals)
+        global_edited_images = np.stack(processed_global_edits)
+        global_mask_images = np.stack(processed_global_masks)
+        global_inpaint_masks = np.stack(processed_global_inpaint_masks)
+        global_valid_masks = np.stack(processed_global_valid_masks)
 
         images = np.stack([
             original_images,
@@ -949,18 +1447,41 @@ def main():
         masks = torch.from_numpy(mask_images)
         inpaint_masks = torch.from_numpy(inpaint_masks)
         centers = torch.from_numpy(centers)
+        global_images = torch.from_numpy(
+            np.stack([global_original_images, global_edited_images])
+        )
+        global_images = 2 * (global_images / 255.0) - 1
+        global_masks = torch.from_numpy(global_mask_images)
+        global_inpaint_masks = torch.from_numpy(global_inpaint_masks)
+        global_valid_masks = torch.from_numpy(global_valid_masks)
 
-        return images, masks, inpaint_masks, centers
+        return (
+            images,
+            masks,
+            inpaint_masks,
+            centers,
+            global_images,
+            global_masks,
+            global_inpaint_masks,
+            global_valid_masks,
+        )
     
     def preprocess_train(examples):
         # Preprocess images.
-        preprocessed_images, mask_images, inpaint_masks, centers = preprocess_images(examples)
+        (
+            preprocessed_images,
+            mask_images,
+            inpaint_masks,
+            centers,
+            global_images,
+            global_masks,
+            global_inpaint_masks,
+            global_valid_masks,
+        ) = preprocess_images(examples)
 
-        # 现在 preprocessed_images 包含四类图像：
-        # [0] original_images: 修复输入图 crop
-        # [1] mask_images:     mask crop
-        # [2] edited_images:   目标图 crop
-        # [3] square_images:   全局 square 图
+        # preprocessed_images contains the native-resolution restoration
+        # input and target. The letterboxed whole-image tensors are returned
+        # separately for the one global sample in each group of eight.
         original_images, edited_images = preprocessed_images
 
         # original_images = original_images.reshape(
@@ -979,6 +1500,11 @@ def main():
         examples["edited_pixel_values"] = edited_images
         examples["inpaint_masks"] = inpaint_masks
         examples["centers"] = centers
+        examples["global_original_pixel_values"] = global_images[0]
+        examples["global_edited_pixel_values"] = global_images[1]
+        examples["global_mask_pixel_values"] = global_masks
+        examples["global_inpaint_masks"] = global_inpaint_masks
+        examples["global_valid_masks"] = global_valid_masks
         # Preprocess the captions.
         captions = list(examples[edit_prompt_column])
         examples["input_ids"] = tokenize_captions(captions)
@@ -1027,13 +1553,34 @@ def main():
             [example["centers"] for example in examples]
         ).float()
 
+        global_original_pixel_values = torch.stack(
+            [example["global_original_pixel_values"] for example in examples]
+        ).to(memory_format=torch.contiguous_format).float()
+        global_edited_pixel_values = torch.stack(
+            [example["global_edited_pixel_values"] for example in examples]
+        ).to(memory_format=torch.contiguous_format).float()
+        global_mask_pixel_values = torch.stack(
+            [example["global_mask_pixel_values"] for example in examples]
+        ).to(memory_format=torch.contiguous_format).float()
+        global_inpaint_masks = torch.stack(
+            [example["global_inpaint_masks"] for example in examples]
+        ).to(memory_format=torch.contiguous_format).float()
+        global_valid_masks = torch.stack(
+            [example["global_valid_masks"] for example in examples]
+        ).to(memory_format=torch.contiguous_format).float()
+
         return {
             "original_pixel_values": original_pixel_values,
             "mask_pixel_values": mask_pixel_values,
             "edited_pixel_values": edited_pixel_values,
             "inpaint_masks": inpaint_masks,
             "input_ids": input_ids,
-            "centers": centers
+            "centers": centers,
+            "global_original_pixel_values": global_original_pixel_values,
+            "global_edited_pixel_values": global_edited_pixel_values,
+            "global_mask_pixel_values": global_mask_pixel_values,
+            "global_inpaint_masks": global_inpaint_masks,
+            "global_valid_masks": global_valid_masks,
         }
 
     # DataLoaders creation:
@@ -1114,19 +1661,54 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(
+        "  Online thumbnail sampling = "
+        f"DDIM/{args.online_thumbnail_num_inference_steps} steps, "
+        f"text guidance {args.online_thumbnail_guidance_scale}, "
+        f"image guidance {args.online_thumbnail_image_guidance_scale}"
+    )
+    if args.conditioning_dropout_prob is None:
+        logger.warning(
+            "Online thumbnail prediction uses three-way classifier-free "
+            "guidance, but conditioning_dropout_prob is disabled. Existing "
+            "checkpoints should have been trained with condition dropout for "
+            "the image-only and unconditional branches to be reliable."
+        )
     global_step = 0
+    online_thumbnail_seed_base = (
+        args.seed
+        if args.seed is not None
+        else int(torch.initial_seed() % (2**31))
+    )
     first_epoch = 0
+    # Keep a valid dataloader offset when no checkpoint exists (including
+    # --resume_from_checkpoint=latest on a fresh output directory).
+    resume_step = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            requested_path = args.resume_from_checkpoint
+            candidate_paths = [requested_path]
+            if not os.path.isabs(requested_path):
+                candidate_paths.append(os.path.join(args.output_dir, requested_path))
+
+            checkpoint_path = next(
+                (candidate for candidate in candidate_paths if os.path.isdir(candidate)),
+                None,
+            )
+            path = (
+                os.path.basename(os.path.normpath(checkpoint_path))
+                if checkpoint_path is not None
+                else None
+            )
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
+            checkpoint_path = os.path.join(args.output_dir, path) if path is not None else None
 
         if path is None:
             accelerator.print(
@@ -1135,7 +1717,7 @@ def main():
             args.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(checkpoint_path)
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
@@ -1282,6 +1864,268 @@ def main():
 
         return torch.cat(crops, dim=0)
 
+    @torch.no_grad()
+    def predict_online_thumbnail(
+        global_image_latents,
+        global_mask_latents,
+        native_full_latents,
+        prompt_embeds,
+        null_prompt_embeds,
+        global_image_pixels,
+        global_inpaint_mask,
+        global_valid_mask,
+        thumbnail_generator,
+    ):
+        """Generate the current model's repaired 512px thumbnail.
+
+        This is a real multi-step diffusion prediction made by the live UNet.
+        It is intentionally detached from the training graph; only the later
+        crop denoising pass contributes gradients.
+        """
+
+        batch_size = global_image_latents.shape[0]
+        latent_height, latent_width = global_image_latents.shape[-2:]
+        device = global_image_latents.device
+        dtype = global_image_latents.dtype
+
+        if (latent_height, latent_width) != (
+            crop_latent_size,
+            crop_latent_size,
+        ):
+            raise ValueError(
+                "Online thumbnail image latents must be 64x64, got "
+                f"{(latent_height, latent_width)}."
+            )
+
+        null_prompt_embeds = null_prompt_embeds.to(
+            device=prompt_embeds.device,
+            dtype=prompt_embeds.dtype,
+        )
+        if null_prompt_embeds.shape[0] == 1 and batch_size > 1:
+            null_prompt_embeds = null_prompt_embeds.expand(
+                batch_size,
+                -1,
+                -1,
+            )
+        if null_prompt_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "Null prompt batch does not match online thumbnail batch: "
+                f"{null_prompt_embeds.shape[0]} vs {batch_size}."
+            )
+
+        center_maps = torch.zeros(
+            batch_size,
+            2,
+            latent_height,
+            latent_width,
+            device=device,
+            dtype=dtype,
+        )
+        zero_image_latents = torch.zeros_like(global_image_latents)
+        zero_mask_latents = torch.zeros_like(global_mask_latents)
+        zero_full_latents = torch.zeros_like(native_full_latents)
+
+        fixed_noise = torch.randn(
+            global_image_latents.shape,
+            generator=thumbnail_generator,
+            device=device,
+            dtype=dtype,
+        )
+        thumbnail_latents = (
+            fixed_noise * online_thumbnail_scheduler.init_noise_sigma
+        )
+        repair_mask_latent = F.interpolate(
+            global_inpaint_mask.float(),
+            size=(latent_height, latent_width),
+            mode="nearest",
+        ).to(device=device, dtype=dtype)
+
+        online_thumbnail_scheduler.set_timesteps(
+            args.online_thumbnail_num_inference_steps,
+            device=device,
+        )
+        inference_timesteps = online_thumbnail_scheduler.timesteps
+
+        def run_unet_branch(
+            latent_model_input,
+            timestep,
+            branch_prompt_embeds,
+            branch_image_latents,
+            branch_mask_latents,
+            branch_full_latents,
+        ):
+            unwrapped_unet.conv_in.set_condition_context(
+                original_crop_latents=branch_image_latents,
+                mask_embeds=branch_mask_latents,
+                original_latents_full=branch_full_latents,
+                center_maps=center_maps,
+            )
+            try:
+                with accelerator.autocast():
+                    return unwrapped_unet(
+                        latent_model_input,
+                        timestep,
+                        encoder_hidden_states=branch_prompt_embeds,
+                        return_dict=False,
+                    )[0]
+            finally:
+                unwrapped_unet.conv_in.clear_condition_context()
+
+        was_training = unwrapped_unet.training
+        unwrapped_unet.eval()
+        try:
+            for timestep_index, timestep in enumerate(inference_timesteps):
+                latent_model_input = online_thumbnail_scheduler.scale_model_input(
+                    thumbnail_latents,
+                    timestep,
+                )
+
+                # Run the three InstructPix2Pix CFG branches sequentially.
+                # This has the same semantics as a 3B concatenated batch but
+                # substantially lowers peak activation memory during training.
+                noise_pred_text = run_unet_branch(
+                    latent_model_input,
+                    timestep,
+                    prompt_embeds,
+                    global_image_latents,
+                    global_mask_latents,
+                    native_full_latents,
+                )
+                noise_pred_image = run_unet_branch(
+                    latent_model_input,
+                    timestep,
+                    null_prompt_embeds,
+                    global_image_latents,
+                    global_mask_latents,
+                    native_full_latents,
+                )
+                noise_pred_uncond = run_unet_branch(
+                    latent_model_input,
+                    timestep,
+                    null_prompt_embeds,
+                    zero_image_latents,
+                    zero_mask_latents,
+                    zero_full_latents,
+                )
+
+                noise_pred = (
+                    noise_pred_uncond
+                    + args.online_thumbnail_guidance_scale
+                    * (noise_pred_text - noise_pred_image)
+                    + args.online_thumbnail_image_guidance_scale
+                    * (noise_pred_image - noise_pred_uncond)
+                )
+
+                thumbnail_latents = online_thumbnail_scheduler.step(
+                    noise_pred,
+                    timestep,
+                    thumbnail_latents,
+                    return_dict=False,
+                )[0]
+
+                # Preserve known pixels throughout sampling, matching the
+                # first-stage inference pipeline. The same initial noise is
+                # used to construct the known latent at every next timestep.
+                if timestep_index < len(inference_timesteps) - 1:
+                    next_timestep = inference_timesteps[timestep_index + 1]
+                    if torch.is_tensor(next_timestep):
+                        next_timestep = next_timestep.reshape(1).to(
+                            device=device,
+                            dtype=torch.long,
+                        ).expand(batch_size)
+                    else:
+                        next_timestep = torch.full(
+                            (batch_size,),
+                            int(next_timestep),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    known_latents = online_thumbnail_scheduler.add_noise(
+                        original_samples=global_image_latents,
+                        noise=fixed_noise,
+                        timesteps=next_timestep,
+                    )
+                else:
+                    known_latents = global_image_latents
+
+                thumbnail_latents = (
+                    repair_mask_latent * thumbnail_latents
+                    + (1.0 - repair_mask_latent) * known_latents
+                )
+        finally:
+            unwrapped_unet.conv_in.clear_condition_context()
+            unwrapped_unet.train(was_training)
+
+        with accelerator.autocast():
+            thumbnail_pixels = vae.decode(
+                thumbnail_latents / vae.config.scaling_factor,
+                return_dict=False,
+            )[0]
+
+        thumbnail_pixels = thumbnail_pixels.clamp(-1.0, 1.0)
+        global_inpaint_mask = global_inpaint_mask.to(
+            device=device,
+            dtype=thumbnail_pixels.dtype,
+        )
+        global_valid_mask = global_valid_mask.to(
+            device=device,
+            dtype=thumbnail_pixels.dtype,
+        )
+        global_image_pixels = global_image_pixels.to(
+            device=device,
+            dtype=thumbnail_pixels.dtype,
+        )
+
+        # Restore known pixels exactly and keep the artificial letterbox black
+        # in normalized [-1, 1] pixel space.
+        thumbnail_pixels = (
+            global_inpaint_mask * thumbnail_pixels
+            + (1.0 - global_inpaint_mask) * global_image_pixels
+        )
+        thumbnail_pixels = (
+            global_valid_mask * thumbnail_pixels
+            - (1.0 - global_valid_mask)
+        )
+        return thumbnail_pixels.detach()
+
+    @torch.no_grad()
+    def build_native_crop_condition(
+        thumbnail_pixels,
+        original_pixels,
+        native_inpaint_mask,
+    ):
+        """Upsample the online thumbnail and composite it in pixel space."""
+
+        native_height, native_width = original_pixels.shape[-2:]
+        resized_width, resized_height, left, top = get_letterbox_geometry(
+            (native_width, native_height)
+        )
+        thumbnail_content = thumbnail_pixels[
+            :,
+            :,
+            top:top + resized_height,
+            left:left + resized_width,
+        ]
+        upsampled_thumbnail = F.interpolate(
+            thumbnail_content.float(),
+            size=(native_height, native_width),
+            mode="bicubic",
+            align_corners=False,
+        ).to(dtype=original_pixels.dtype)
+        upsampled_thumbnail = upsampled_thumbnail.clamp(-1.0, 1.0)
+
+        native_inpaint_mask = (
+            native_inpaint_mask >= 0.5
+        ).to(
+            device=original_pixels.device,
+            dtype=original_pixels.dtype,
+        )
+        crop_condition_pixels = (
+            native_inpaint_mask * upsampled_thumbnail
+            + (1.0 - native_inpaint_mask) * original_pixels
+        )
+        return crop_condition_pixels.detach()
+
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
@@ -1328,6 +2172,20 @@ def main():
 
             inpaint_masks_full = batch[
                 "inpaint_masks"
+            ].to(
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+
+            global_inpaint_masks = batch[
+                "global_inpaint_masks"
+            ].to(
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+
+            global_valid_masks = batch[
+                "global_valid_masks"
             ].to(
                 device=accelerator.device,
                 dtype=weight_dtype,
@@ -1391,20 +2249,128 @@ def main():
                         * vae.config.scaling_factor
                     )
 
-                    del original_pixel_values
+                    # The whole-image branch is resized and letterboxed at
+                    # pixel level in preprocessing, then encoded by the VAE.
+                    # original_latents_full remains the raw mean-filled global
+                    # condition for the one whole-image sample in each group.
+                    global_edited_pixel_values = batch[
+                        "global_edited_pixel_values"
+                    ].to(
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                    )
+                    global_target_latents = (
+                        vae.encode(global_edited_pixel_values)
+                        .latent_dist.sample()
+                        * vae.config.scaling_factor
+                    )
+                    del global_edited_pixel_values
+
+                    global_original_pixel_values = batch[
+                        "global_original_pixel_values"
+                    ].to(
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                    )
+                    global_original_image_embeds = (
+                        vae.encode(global_original_pixel_values)
+                        .latent_dist.mode()
+                        * vae.config.scaling_factor
+                    )
+
+                    global_mask_pixel_values = batch[
+                        "global_mask_pixel_values"
+                    ].to(
+                        device=accelerator.device,
+                        dtype=weight_dtype,
+                    )
+                    # Keep the mask-condition network shape unchanged while
+                    # exposing the actual repair region to the model.  The
+                    # pseudo-RGB mask uses the fixed channel convention:
+                    #   R = dataset mask, G = dataset mask,
+                    #   B = inpaint mask (1 means repair this pixel).
+                    global_mask_3ch = torch.cat(
+                        [
+                            global_mask_pixel_values,
+                            global_mask_pixel_values,
+                            global_inpaint_masks,
+                        ],
+                        dim=1,
+                    )
+                    global_mask_3ch = global_mask_3ch * 2.0 - 1.0
+                    global_mask_embeds = (
+                        vae.encode(global_mask_3ch)
+                        .latent_dist.mode()
+                        * vae.config.scaling_factor
+                    )
+                    del global_mask_pixel_values
+                    del global_mask_3ch
 
                     encoder_hidden_states_full = text_encoder(
                         input_ids
                     )[0]
 
-                    if args.conditioning_dropout_prob is not None:
-                        null_conditioning = text_encoder(
-                            tokenize_captions([""]).to(
-                                accelerator.device
-                            )
-                        )[0]
-                    else:
-                        null_conditioning = None
+                    # Online three-way InstructPix2Pix CFG always needs the
+                    # empty-text embedding, even when training condition
+                    # dropout itself is disabled.
+                    null_conditioning = text_encoder(
+                        tokenize_captions([""]).to(
+                            accelerator.device
+                        )
+                    )[0]
+
+                    thumbnail_seed = (
+                        online_thumbnail_seed_base
+                        + accelerator.process_index * 1_000_003
+                        + epoch * max(len(train_dataloader), 1)
+                        + step
+                    ) % (2**63 - 1)
+                    thumbnail_generator = torch.Generator(
+                        device=accelerator.device
+                    ).manual_seed(thumbnail_seed)
+
+                    # Stage 1: the current live model makes one real 512px
+                    # prediction per source image. No clean target tensor is
+                    # passed into this call.
+                    online_thumbnail_pixels = predict_online_thumbnail(
+                        global_image_latents=global_original_image_embeds,
+                        global_mask_latents=global_mask_embeds,
+                        native_full_latents=original_latents_full,
+                        prompt_embeds=encoder_hidden_states_full,
+                        null_prompt_embeds=null_conditioning,
+                        global_image_pixels=global_original_pixel_values,
+                        global_inpaint_mask=global_inpaint_masks,
+                        global_valid_mask=global_valid_masks,
+                        thumbnail_generator=thumbnail_generator,
+                    )
+
+                    # Stage 2 conditioning is constructed in pixel space:
+                    # the model prediction fills only the repair region and
+                    # all known pixels come from the mean-filled input.
+                    crop_condition_pixel_values = build_native_crop_condition(
+                        thumbnail_pixels=online_thumbnail_pixels,
+                        original_pixels=original_pixel_values,
+                        native_inpaint_mask=inpaint_masks_full,
+                    )
+                    crop_condition_latents_full = (
+                        vae.encode(crop_condition_pixel_values)
+                        .latent_dist.mode()
+                        * vae.config.scaling_factor
+                    )
+
+                    if crop_condition_latents_full.shape != original_latents_full.shape:
+                        raise ValueError(
+                            "Online crop-condition latent shape does not match "
+                            "the native filled-image latent: "
+                            f"{crop_condition_latents_full.shape} vs "
+                            f"{original_latents_full.shape}."
+                        )
+
+                    del thumbnail_generator
+                    del online_thumbnail_pixels
+                    del crop_condition_pixel_values
+                    del original_pixel_values
+                    del global_original_pixel_values
 
                     # latents_full = (
                     #     latents_full
@@ -1436,27 +2402,30 @@ def main():
             original_latents_full = (
                 original_latents_full.detach()
             )
+            crop_condition_latents_full = (
+                crop_condition_latents_full.detach()
+            )
+            global_target_latents = global_target_latents.detach()
+            global_original_image_embeds = global_original_image_embeds.detach()
+            global_mask_embeds = global_mask_embeds.detach()
             encoder_hidden_states_full = (
                 encoder_hidden_states_full.detach()
             )
 
-            if null_conditioning is not None:
-                null_conditioning = (
-                    null_conditioning.detach()
-                )
+            null_conditioning = null_conditioning.detach()
 
             # =====================================================
-            # 3. 当前两张图片，每张扩展成 4 个 crop
+            # 3. 每张完整图片扩展成 8 个训练样本
             #
             # B=2 时：
-            # [2, 4, 2] -> [8, 2]
+            # [2, 8, 2] -> [16, 2]
             # =====================================================
             centers = all_centers.reshape(
                 full_bsz * num_crops_per_image,
                 2,
             )
 
-            # 完整 latent 从 B 扩展到 B*4
+            # 完整 latent 从 B 扩展到 B*8
             latents_full_repeated = (
                 latents_full.repeat_interleave(
                     num_crops_per_image,
@@ -1465,6 +2434,12 @@ def main():
             )
 
             original_latents_full_repeated = (
+                crop_condition_latents_full.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+            )
+            filled_original_latents_full_repeated = (
                 original_latents_full.repeat_interleave(
                     num_crops_per_image,
                     dim=0,
@@ -1493,8 +2468,30 @@ def main():
                 )
             )
 
+            # Exactly one of each image's eight expanded samples is a
+            # whole-image restoration sample. The selected sample gets a
+            # letterboxed 512x512 VAE input and position (0, 0).
+            global_sample_indices = torch.randint(
+                num_crops_per_image,
+                (full_bsz,),
+                device=accelerator.device,
+            )
+            is_global_sample = torch.zeros(
+                full_bsz,
+                num_crops_per_image,
+                device=accelerator.device,
+                dtype=torch.bool,
+            )
+            is_global_sample.scatter_(
+                1,
+                global_sample_indices.unsqueeze(1),
+                True,
+            )
+            is_global_sample = is_global_sample.reshape(-1)
+            is_global_sample_4d = is_global_sample.view(-1, 1, 1, 1)
+
             # =====================================================
-            # 4. 一次训练 8 个 crop
+            # 4. 一次训练 7 个 crop + 1 个全图样本
             # =====================================================
             with accelerator.accumulate(unet):
                 (
@@ -1505,19 +2502,99 @@ def main():
                     latents_full_repeated,
                     original_latents_full_repeated,
                     centers,
-                    crop_latent_size=64,
+                    crop_latent_size=crop_latent_size,
                 )
 
-                # B=2 时，bsz=8
+                # B=1 时，bsz=8；其中一个样本用全图 latent 替换。
                 bsz = latents.shape[0]
+
+                global_target_latents_repeated = global_target_latents.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+                global_original_image_embeds_repeated = (
+                    global_original_image_embeds.repeat_interleave(
+                        num_crops_per_image,
+                        dim=0,
+                    )
+                )
+                global_mask_embeds_repeated = global_mask_embeds.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+
+                latents = torch.where(
+                    is_global_sample_4d,
+                    global_target_latents_repeated,
+                    latents,
+                )
+                original_image_embeds = torch.where(
+                    is_global_sample_4d,
+                    global_original_image_embeds_repeated,
+                    original_image_embeds,
+                )
+                # Crop rows retain the VAE latent of the pixel-composited
+                # two-stage condition.  The single whole-image row retains
+                # the original raw filled full-image context, exactly as in
+                # the existing global-repair branch.
+                original_latents_full_repeated = torch.where(
+                    is_global_sample_4d,
+                    filled_original_latents_full_repeated,
+                    original_latents_full_repeated,
+                )
+                centers = torch.where(
+                    is_global_sample.view(-1, 1),
+                    torch.zeros_like(centers),
+                    centers,
+                )
+
+                inpaint_mask_crop = (
+                    crop_mask_by_centers(
+                        inpaint_masks_repeated,
+                        centers,
+                        crop_pixel_size=crop_pixel_size,
+                    )
+                )
+
+                global_inpaint_masks_repeated = global_inpaint_masks.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+                global_valid_masks_repeated = global_valid_masks.repeat_interleave(
+                    num_crops_per_image,
+                    dim=0,
+                )
+                valid_loss_mask = torch.ones_like(inpaint_mask_crop)
+                inpaint_mask_crop = torch.where(
+                    is_global_sample_4d,
+                    global_inpaint_masks_repeated,
+                    inpaint_mask_crop,
+                )
+                valid_loss_mask = torch.where(
+                    is_global_sample_4d,
+                    global_valid_masks_repeated,
+                    valid_loss_mask,
+                )
+
                 with torch.no_grad():
                     with accelerator.autocast():
                         mask_crop = crop_mask_by_centers(
                             mask_full_repeated,
                             centers,
-                            crop_pixel_size=512,
+                            crop_pixel_size=crop_pixel_size,
                         )
-                        mask_3ch = mask_crop.repeat(1, 3, 1, 1)
+                        # Preserve the existing three-channel VAE input and
+                        # four-channel mask latent, but use the blue channel
+                        # to carry the repair-region mask.  This does not
+                        # change the UNet or checkpoint parameter shapes.
+                        mask_3ch = torch.cat(
+                            [
+                                mask_crop,
+                                mask_crop,
+                                inpaint_mask_crop,
+                            ],
+                            dim=1,
+                        )
                         mask_3ch = mask_3ch * 2.0 - 1.0
                         # [B, 3, 512, 512] -> [B, 4, 64, 64]
                         mask_image_embeds = (
@@ -1532,13 +2609,10 @@ def main():
                         
                         del mask_3ch
 
-
-                inpaint_mask_crop = (
-                    crop_mask_by_centers(
-                        inpaint_masks_repeated,
-                        centers,
-                        crop_pixel_size=512,
-                    )
+                mask_image_embeds = torch.where(
+                    is_global_sample_4d,
+                    global_mask_embeds_repeated,
+                    mask_image_embeds,
                 )
 
                 # 每个 crop 独立噪声
@@ -1716,12 +2790,21 @@ def main():
                     )
                 )
 
+                valid_mask_64 = F.interpolate(
+                    valid_loss_mask.float(),
+                    size=model_pred.shape[-2:],
+                    mode="nearest",
+                ).expand_as(model_pred)
+
                 repair_weight_alpha = 8.0
 
                 loss_weights = (
-                    1.0
-                    + repair_weight_alpha
-                    * inpaint_mask_64.float()
+                    valid_mask_64.float()
+                    * (
+                        1.0
+                        + repair_weight_alpha
+                        * inpaint_mask_64.float()
+                    )
                 )
 
                 loss_map = F.mse_loss(
@@ -1739,8 +2822,13 @@ def main():
                     .clamp_min(1e-8)
                 )
 
-                normal_loss = loss_map.mean(
-                    dim=(1, 2, 3)
+                normal_loss = (
+                    (loss_map * valid_mask_64)
+                    .sum(dim=(1, 2, 3))
+                    /
+                    valid_mask_64
+                    .sum(dim=(1, 2, 3))
+                    .clamp_min(1e-8)
                 )
 
                 bsz = model_pred.shape[0]
@@ -1810,6 +2898,7 @@ def main():
                     {
                         "train_loss": train_loss,
                         "crop_batch_size": bsz,
+                        "global_samples": int(is_global_sample.sum().item()),
                     },
                     step=global_step,
                 )
@@ -1897,8 +2986,16 @@ def main():
 
             del latents_full
             del original_latents_full
+            del crop_condition_latents_full
             del latents_full_repeated
             del original_latents_full_repeated
+            del filled_original_latents_full_repeated
+            del global_target_latents
+            del global_original_image_embeds
+            del global_mask_embeds
+            del global_target_latents_repeated
+            del global_original_image_embeds_repeated
+            del global_mask_embeds_repeated
 
             del mask_full
             del mask_full_repeated
@@ -1909,6 +3006,12 @@ def main():
             del inpaint_masks_repeated
             del inpaint_mask_crop
             del inpaint_mask_64
+            del global_inpaint_masks
+            del global_inpaint_masks_repeated
+            del global_valid_masks
+            del global_valid_masks_repeated
+            del valid_loss_mask
+            del valid_mask_64
 
             del encoder_hidden_states_full
             del encoder_hidden_states
@@ -1919,6 +3022,9 @@ def main():
             del centers
             del all_centers
             del center_maps
+            del global_sample_indices
+            del is_global_sample
+            del is_global_sample_4d
 
             del latents
             del original_image_embeds

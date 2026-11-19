@@ -274,6 +274,10 @@ def prepare_input(
         mask
     )
 
+    inpaint_mask = crop_to_8(
+        inpaint_mask
+    )
+
     return (
         original,
         edited,

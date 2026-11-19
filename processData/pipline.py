@@ -383,6 +383,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
         # ------------------------------------------------------------
         mask_latents_full = self.encode_mask_to_latents(
             mask_images=mask_image,
+            inpaint_masks=binary_mask,
             dtype=dtype,
             device=device,
             encode_batch_size=crop_process_batch_size,
@@ -1235,6 +1236,7 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
     def encode_mask_to_latents(
         self,
         mask_images: torch.Tensor,
+        inpaint_masks: torch.Tensor,
         dtype,
         device,
         encode_batch_size: int = 8,
@@ -1246,9 +1248,12 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             mask_images:
                 [N, 1, H, W]
                 range [0, 1]
+            inpaint_masks:
+                [N, 1, H, W]
+                range [0, 1], where 1 means the repair region
 
         处理：
-            1. 重复成三通道
+            1. 按 [mask, mask, inpaint_mask] 组成三通道
             2. 从 [0,1] 映射到 [-1,1]
             3. 使用 VAE 编码
             4. 使用 latent distribution 的 mode
@@ -1269,6 +1274,18 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
                 f"mask_images 应为单通道，实际通道数为 {mask_images.shape[1]}"
             )
 
+        if inpaint_masks.ndim != 4 or inpaint_masks.shape[1] != 1:
+            raise ValueError(
+                "inpaint_masks 应为 [N,1,H,W]，"
+                f"实际为 {inpaint_masks.shape}"
+            )
+
+        if inpaint_masks.shape != mask_images.shape:
+            raise ValueError(
+                "mask_images 和 inpaint_masks 必须具有相同形状，"
+                f"实际为 {mask_images.shape} 和 {inpaint_masks.shape}"
+            )
+
         if encode_batch_size <= 0:
             raise ValueError(
                 f"encode_batch_size 必须大于 0，实际为 {encode_batch_size}"
@@ -1278,9 +1295,14 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             device=device,
             dtype=dtype,
         )
+        inpaint_masks = inpaint_masks.to(
+            device=device,
+            dtype=dtype,
+        )
 
         # 避免输入 mask 因格式问题超过 [0,1]
         mask_images = mask_images.clamp(0.0, 1.0)
+        inpaint_masks = inpaint_masks.clamp(0.0, 1.0)
 
         mask_latent_chunks = []
 
@@ -1291,13 +1313,14 @@ class SlidingWindowInstructPix2PixPipeline(BaseInstructPix2PixPipeline):
             )
 
             mask_chunk = mask_images[start:end]
+            inpaint_chunk = inpaint_masks[start:end]
 
-            # [B,1,H,W] -> [B,3,H,W]
-            mask_3ch = mask_chunk.repeat(
-                1,
-                3,
-                1,
-                1,
+            # [B,1,H,W] + [B,1,H,W] -> [B,3,H,W]
+            # R/G retain the original dataset-mask condition; B explicitly
+            # marks the inpainting region, matching training exactly.
+            mask_3ch = torch.cat(
+                [mask_chunk, mask_chunk, inpaint_chunk],
+                dim=1,
             )
 
             # [0,1] -> [-1,1]
